@@ -1,0 +1,56 @@
+LOCAL_PATH:= $(call my-dir)
+
+include $(CLEAR_VARS)
+LOCAL_SRC_FILES:= vulkdev_exp1.c
+LOCAL_MODULE:= vulkdev_exp1
+LOCAL_FORCE_STATIC_EXECUTABLE:= true
+include $(BUILD_EXECUTABLE)
+
+include $(CLEAR_VARS)
+LOCAL_SRC_FILES:= vulkdev_exp2.1.c
+LOCAL_MODULE:= vulkdev_exp2.1
+LOCAL_FORCE_STATIC_EXECUTABLE:= true
+include $(BUILD_EXECUTABLE)
+
+include $(CLEAR_VARS)
+LOCAL_SRC_FILES:= vulkdev_exp2.2.c
+LOCAL_MODULE:= vulkdev_exp2.2
+LOCAL_FORCE_STATIC_EXECUTABLE:= true
+include $(BUILD_EXECUTABLE)
+
+include $(CLEAR_VARS)
+LOCAL_SRC_FILES:= vulkdev_exp2.3.c
+LOCAL_MODULE:= vulkdev_exp2.3
+LOCAL_FORCE_STATIC_EXECUTABLE:= true
+include $(BUILD_EXECUTABLE)
+
+include $(CLEAR_VARS)
+LOCAL_SRC_FILES:= vulkdev_exp3.c
+LOCAL_MODULE:= vulkdev_exp3
+LOCAL_FORCE_STATIC_EXECUTABLE:= true
+include $(BUILD_EXECUTABLE)
+
+include $(CLEAR_VARS)
+LOCAL_SRC_FILES:= vulkdev_exp4.1.c
+LOCAL_MODULE:= vulkdev_exp4.1
+LOCAL_FORCE_STATIC_EXECUTABLE:= true
+include $(BUILD_EXECUTABLE)
+
+include $(CLEAR_VARS)
+LOCAL_SRC_FILES:= vulkdev_exp4.2.c
+LOCAL_MODULE:= vulkdev_exp4.2
+LOCAL_FORCE_STATIC_EXECUTABLE:= true
+include $(BUILD_EXECUTABLE)
+
+include $(CLEAR_VARS)
+LOCAL_SRC_FILES:= vulkdev_exp4.3.c
+LOCAL_MODULE:= vulkdev_exp4.3
+LOCAL_FORCE_STATIC_EXECUTABLE:= true
+include $(BUILD_EXECUTABLE)
+
+include $(CLEAR_VARS)
+LOCAL_SRC_FILES:= vulkdev_exp4.4.c
+LOCAL_MODULE:= vulkdev_exp4.4
+LOCAL_FORCE_STATIC_EXECUTABLE:= true
+include $(BUILD_EXECUTABLE)
+

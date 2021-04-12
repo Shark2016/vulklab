@@ -1,0 +1,128 @@
+### 下载内核
+下载编译内核，需要Linux 64-bit环境，否则编译出错
+不方便翻墙所以使用国内镜像地址：
+git clone https://aosp.tuna.tsinghua.edu.cn/kernel/goldfish.git
+git checkout -t origin/android-goldfish-3.4 -b goldfish3.4
+
+### arm-eabi-编译工具
+有android源码，可以在如下路径找到：
+prebuilts/gcc/linux-x86/arm/arm-eabi-4.8
+没有可以通过如下方式获得，需翻墙
+git clone https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/arm/arm-eabi-4.6
+不方便翻墙所以使用国内镜像地址：
+git clone https://aosp.tuna.tsinghua.edu.cn/platform/prebuilts/gcc/linux-x86/arm/arm-eabi-4.6
+
+### 内核编译
+export PATH=/workspace/vulklab/arm-eabi-4.6/bin:$PATH
+export ARCH=arm
+export SUBARCH=arm
+export CROSS_COMPILE=arm-eabi-
+
+make goldfish_armv7_defconfig
+make menuconfig         // if need ncurse, try this: sudo apt-get install libncurses5-dev
+make -j32
+
+menuconfig中需要开启以下选项:
+Kernel hacking:
+    Kernel debugging
+    Collect scheduler debugging info
+    Collect scheduler statistics
+    kobject debugging
+    Compile the kernel with debug info
+    KGDB: kernel debugging with remote gdb
+    Verbose kernel error messages
+Enable loadable module support:
+    Force module loading
+    Module unloading
+        Forced module unloading
+
+
+编译后生成的内核位于：arch/arm/boot/zImage
+
+### 安装sdk等工具
+需要先安装java环境，注意版本使用jdk1.8，不然jdk1.7执行sdk命令遇到报错"Unsupported major.minor version 52.0"，oracle官网下载jdk解压并加入环境变量即可
+下载jdk-8u151-linux-x64.tar.gz
+tar xvf jdk-8u151-linux-x64.tar.gz
+export JAVA_HOME=/workspace/vulklab/jdk1.8.0_231
+export CLASSPATH=.:$CLASSPATH:$JAVA_HOME/lib:$JAVA_HOME/jre/lib
+export PATH=$JAVA_HOME/bin:$JAVA_HOME/jre/bin:$PATH:$HOME/bin
+java -version
+
+下载sdk工具，需要用它来安装模拟器用到的system镜像和创建模拟器
+
+wget https://dl.google.com/android/repository/sdk-tools-linux-4333796.zip
+mkdir sdk
+mv sdk-tools-linux-4333796.zip sdk
+cd sdk/
+unzip sdk-tools-linux-4333796.zip
+rm sdk-tools-linux-4333796.zip
+cd tools/bin
+./sdkmanager --update
+./sdkmanager --list
+./sdkmanager --install "ndk-bundle" # ndk，可以用来编译exp
+./sdkmanager --install "emulator" # android模拟器
+./sdkmanager --install "platforms;android-19" # avd
+./sdkmanager --install "system-images;android-19;google_apis;armeabi-v7a"
+./sdkmanager --install "platform-tools" # adb等工具
+
+### 创建模拟器
+./avdmanager create avd --name vulklab -k "system-images;android-19;google_apis;armeabi-v7a"
+
+### 运行模拟器
+注意运行模拟器有几个注意的，现在新版本模拟器只支持3.10以上内核，如果3.10的内核，按下面操作即可：
+export ANDROID_SDK_ROOT=/workspace/vulklab/sdk
+export PATH=$ANDROID_SDK_ROOT/emulator:$ANDROID_SDK_ROOT/platform-tools:$PATH
+emulator @vulklab -kernel arch/arm/boot/zImage -verbose -debug init -show-kernel -no-boot-anim -no-skin -no-audio -no-window -qemu -s
+
+但我们现在调试3.4的内核会报错，我们可以下载使用老版本的模拟器来启动：
+wget https://dl.google.com/android/adt/adt-bundle-linux-x86_64-20140702.zip
+unzip adt-bundle-linux-x86_64-20140702.zip
+老版本模拟器位于adt-bundle-linux-x86_64-20140702/sdk/tools/emulator
+将这个路径加到环境变量再运行即可，模拟器命令和上面一样，我这里是直接将这个二进制拷贝到$ANDROID_SDK_ROOT/tools/emulatorx，并将目录加到环境变量中，通过emulatorx来执行3.4内核模拟器。
+
+### 获取arm-gdb:
+wget https://raw.githubusercontent.com/teawater/get-gdb/master/get-gdb.py
+python get-gdb.py # arm-gdb自动编译脚本
+版本这里选了gdb v7.2，编译架构选arm-linux，安装路径可以选择/workspace/vulklab/arm-linux-gdb，实测调试可用。
+
+export PATH=/workspace/vulklab/arm-linux-gdb/bin:$PATH
+
+### 调试内核:
+上面模拟器运行情况下，运行gdb调试
+arm-linux-gdb goldfish/vmlinux
+(gdb) target remote:1234
+这里的vmlinux是内核源码根目录下编译生成的
+接下来即可开始调试，部分示例如下：
+
+arm-linux-gdb goldfish/vmlinux
+(gdb) target remote:1234
+Remote debugging using :1234
+warning: Architecture rejected target-supplied description
+0x00000001 in ?? ()
+(gdb) c
+Continuing.
+^C
+Program received signal SIGINT, Interrupt.
+0xb5a7fd40 in ?? ()
+(gdb) c
+Continuing.
+^C Ctrl+C打断当前Continue执行状态以便执行gdb命令
+(gdb) b futex_lock_pi 断点指定函数
+(gdb) b kernel/futex.c:1234 断点指定文件指定行
+(gdb) c 继续
+将触发目标代码的测试程序push到模拟器执行，使相关内核代码调用触发
+(gdb) list 查看源码
+(gdb) ptype struct task_struct 查看task_struct结构体格式
+(gdb) ptype rt_waiter
+(gdb) ptype timeout
+(gdb) bt //check the backtrace of this function
+(gdb) print sizeof(rt_waiter)
+(gdb) print sizeof(hb)
+(gdb) print &key2
+
+补充说明：
+创建的模拟器默认情况下，ram可能比较小，有时候跑写程序在模拟器中，可能会触发lowmemorykiller而导致进程被杀，甚至adbd被杀导致adb断开，这时候可以编辑相应模拟配置文件更改配置解决：
+例如上面创建的vulklab，配置文件在默认为~/.android/avd/vulklab.avd/config.ini，编辑这个文件，添加一行：hw.ramSize=512
+即可将ramSize改为512MB，重新启动模拟器，发现不再被杀了。
+
+

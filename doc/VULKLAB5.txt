@@ -1,0 +1,257 @@
+
+
+关于物理内存映射漏洞，建议先阅读参考资料文档，比较详细。
+
+内核mmap接口目的是为了加快用户态和内核态的数据交换，内核通过这种方式可以直接将一块内核缓冲区或物理内存共享给用户地址空间，用户地址空间就可以不通过任何syscall就可以直接更改这些内存。
+
+mmap相关漏洞分多种，这里主要讲利用。利用思路也比较简单，就mmap出来，进行内核读写：
+1. 搜索当前进程cred结构，直接修改uid提权
+2. 搜索字符串"%pK %c %s\n"，修改成"%p %c %s\n"，可以绕过kptr_restrict，读取sys_setresuid符号地址，并且patch掉其中的检查，然后调用setresuid(0,0,0)即可实现提权。
+3. 其他思路例如修改syscall、idt等应该也是可以的，只是利用就比较复杂了，不再测试。
+
+1. 最常见的问题实现如下：
+static int vulkdev_mmap(struct file *fp, struct vm_area_struct *vma)
+{
+ printk(KERN_NOTICE "VULKLAB: vulkdev_mmap addr=%lx, pfn=%lx, size=%lx\n",
+   vma->vm_start, vma->vm_pgoff, vma->vm_end - vma->vm_start);
+ if (remap_pfn_range(vma, vma->vm_start, vma->vm_pgoff,
+  vma->vm_end - vma->vm_start, vma->vm_page_prot)) {
+  return -EAGAIN;
+ }
+ return 0;
+}
+
+用户态对应代码：
+size_t size = 0x15400000;
+off_t offset = 0x40000000;
+unsigned long start = 0x42424000;
+unsigned int *addr = (unsigned int *)mmap((void *)start, size, PROT_READ|PROT_WRITE, MAP_SHARED, fd, offset);
+
+调用这段代码，查看内核日志如下：
+VULKLAB: vulkdev_mmap addr=42424000, pfn=40000, size=15400000
+并且通过cat /proc/<pid>/maps也可以看到这段内存映射。
+
+可以看到，remap_pfn_range的参数都是我们可以控制的。offset就是映射的物理内存起始地址，size就是映射的内存大小。
+
+另外，有权限下可以通过/proc/iomem查看物理内存布局，其中System RAM是我们关心的内核内存部分，包括内核代码和数据。
+root@generic:/ # cat /proc/iomem
+09000000-09000fff : /pl011@9000000
+  09000000-09000fff : uart-pl011
+0a000000-0a0001ff : a000000.virtio_mmio
+0a000200-0a0003ff : a000200.virtio_mmio
+(略...)
+0a003e00-0a003fff : a003e00.virtio_mmio
+40000000-553fffff : System RAM
+  40008000-4058aadb : Kernel code
+  405ba000-4061f11b : Kernel data
+当然普通权限下可能没权限访问，这就是黑盒状态了，但我们可以通过搜索内核内存的关键字符串达到更改内核和提权目的。
+在模拟器上测试时，mmap到前面的这些内存，进行读取访问时，模拟器会崩，不知道真机上会怎么样，但参考文档是从0地址开始mmap的。
+
+vulkdev_exp4.1就是使用了搜索和修改cred的形式，发现uid、gid等和当前uid匹配，就尝试更新为uid，并getuid()检查是否提权成功，如果提权失败说明搜索的cred不对，则恢复改动，再搜索下一处，直到提权成功，并修改cap为0xffffffff。另外不同设备上内存布局也不同，System RAM 也可能分为两段不连续的区域，只mmap了其中一段，搜索 cred 不一定每次都能找到，可以多试几次，或者 fork 多个子进程，每个子进程再修改自己的 cred来提高成功率。
+
+vulkdev_exp4.2则是通过patch字符串"%pK %c %s\n"方式先获取sys_setresuid符号地址，再根据地址计算相应的映射地址，并patch函数内的检查，最后调用 setresuid(0,0,0)实现提权。
+
+2. 
+static int size = 0x10000;
+
+static int vulkdev_open(struct inode *inode, struct file *filp)
+{
+ filp->private_data = kzalloc(size, GFP_KERNEL);
+ if (filp->private_data == NULL)
+  return -1;
+ return 0;
+}
+
+static int vulkdev_mmap(struct file *filp, struct vm_area_struct *vma)
+{
+ if (remap_pfn_range(vma, vma->vm_start, virt_to_pfn(filp->private_data),
+  vma->vm_end - vma->vm_start, vma->vm_page_prot)) {
+  return -EAGAIN;
+ }
+ return 0;
+}
+
+3. fault处理函数利用
+static int size = 0x1000;
+
+void simple_vma_open(struct vm_area_struct *vma)
+{
+ printk(KERN_NOTICE "VULKLAB: simple_vma_open, virt %lx, phys %lx\n",
+  vma->vm_start, vma->vm_pgoff << PAGE_SHIFT);
+}
+
+void simple_vma_close(struct vm_area_struct *vma)
+{
+ printk(KERN_NOTICE "VULKLAB: simple_vma_close\n");
+}
+
+int simple_vma_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
+{
+ struct page *page = NULL;
+ unsigned long offset;
+
+ printk(KERN_NOTICE "VULKLAB: simple_vma_fault\n");
+ printk(KERN_NOTICE "VULKLAB: vmf->pgoff: %lx, vma->vm_pgoff: %lx, sum: %lx, PAGE_SHIFT: %x\n",
+  (unsigned long)vmf->pgoff,
+  (unsigned long)vma->vm_pgoff,
+  ((vmf->pgoff << PAGE_SHIFT) + (vma->vm_pgoff << PAGE_SHIFT)),
+  PAGE_SHIFT);
+
+ offset = (((unsigned long)vmf->virtual_address - vma->vm_start) + (
+  vma->vm_pgoff << PAGE_SHIFT));
+ if (offset > PAGE_SHIFT << 4)
+  goto nopage_out;
+
+ page = virt_to_page(vma->vm_private_data + offset);
+ vmf->page = page;
+ get_page(page);
+
+nopage_out:
+ return 0;
+}
+
+static struct vm_operations_struct simple_remap_vm_ops = {
+ .open = simple_vma_open,
+ .close = simple_vma_close,
+ .fault = simple_vma_fault,
+};
+
+static int vulkdev_open(struct inode *inode, struct file *filp)
+{
+ filp->private_data = kzalloc(size, GFP_KERNEL);
+ if (filp->private_data == NULL)
+  return -1;
+ return 0;
+}
+
+static int vulkdev_release(struct inode *inode, struct file *filp)
+{
+ return 0;
+}
+
+static int vulkdev_mmap(struct file *filp, struct vm_area_struct *vma)
+{
+ vma->vm_private_data = filp->private_data;
+ vma->vm_ops = &simple_remap_vm_ops;
+ simple_vma_open(vma);
+
+ printk(KERN_INFO "VULKLAB: device mmap ok\n");
+ return 0;
+}
+上面的例子假设该设备只读，那么我们就不能将其映射为可读写，只能读取映射内存。
+上面实现中分配了0x1000的内存。vulkdev_mmap中也没有验证参数是否合法。
+在simple_vma_fault中，将运算得到的offset加上先前分配的缓冲区地址，将取得的page赋值给vmf->page，这样就能让这个page映射到缺页异常发生的地方。
+这里有个检查：
+ if (offset > PAGE_SHIFT << 4)
+  goto nopage_out;
+当offset大于0x10000时将禁止访问该页。但这里分配的内存大小为0x1000，因此我们可以多访问到分配缓冲区之后的0x9000大小的内存，达到泄露内核内存的目的：
+unsigned long size = 0x10000;
+unsigned long mmapStart = 0x42424000;
+unsigned int * addr = (unsigned int *)mmap((void*)mmapStart, size, PROT_READ, MAP_SHARED, fd, 0x0);
+
+另外在这个例子中假设在vulkdev_mmap中做了size大小的检查：
+static int vulkdev_mmap(struct file *filp, struct vm_area_struct *vma)
+{
+ unsigned long size = vma->vm_end - vma->vm_start;
+ printk(KERN_INFO "MWR: Device simple_vma_ops_mmap\n");
+ vma->vm_private_data = filp->private_data;
+ vma->vm_ops = &simple_remap_vm_ops; simple_vma_open(vma);
+ if (size > 0x1000)
+ {
+  printk(KERN_INFO "MWR: mmap failed, requested too large a chunk of memory\n");
+  return -EAGAIN;
+ }
+ printk(KERN_INFO "MWR: Device mmap OK\n");
+ return 0;
+}
+虽然这样限制了我们可以mmap一个大内存，但我们依然有办法利用：
+先通过mmap调用映射0x1000字节大小内存
+再通过mremap调用重映射0x10000字节大小的内存
+unsigned long size = 0x1000;
+unsigned long mmapStart = 0x42424000;
+unsigned int * addr = (unsigned int *)mmap((void*)mmapStart, size, PROT_READ, MAP_SHARED, fd, 0x0);
+addr = (unsigned int *)mremap(addr, size, 0x10000, 0);
+
+
+4. 错误的参数检查
+mmap实现上，应该添加相关检查，但检查实现也可能存在问题。
+static int integer_overflow_mmap(struct file *filp, struct vm_area_struct *vma)
+{
+ unsigned int vma_size = vma->vm_end - vma->vm_start;
+ unsigned int offset = vma->vm_pgoff << PAGE_SHIFT;
+ printk(KERN_INFO "MWR: Device integer_overflow_mmap( vma_size: %x, offset: %x)\n", vma_size, offset);
+ if (vma_size + offset > 0x10000) {
+  printk(KERN_INFO "MWR: mmap failed, requested too large a chunk of memory\n");
+  return -EAGAIN;
+ }
+  
+ if (remap_pfn_range(vma, vma->vm_start, virt_to_pfn(filp->private_data),
+  vma_size, vma->vm_page_prot)) {
+  printk(KERN_INFO "MWR: Device integer_overflow_mmap failed\n"); return -EAGAIN;
+ }
+ printk(KERN_INFO "MWR: Device integer_overflow_mmap OK\n");
+ return 0;
+}
+这里的检查存在整数溢出。当用户态进程调用mmap2，参数size=0xfffa000,offset=0xf0006,经过移位求和之后，相加为0x100000000，出现整数溢出结果为0，并成功映射大小为0xfffa000的内核内存。mmap2可以让应用使用32位的off_t类型使用大数值作为offset参数。值得注意的是，mmap2在64位内核syscall table中通常是无效的，然而如果系统既支持32位又支持64位应用的话，那么可以在32位应用中通过调用mmap2来触发，因为32位应用和64位应用使用的是两个不同的syscall table。
+
+
+再看下面这个例子：
+这里使用了有符号整数。这里可以使用负值如0xf0000000来绕过检查，从而映射0xf0000000大小的内存到用户空间。
+static int signed_integer_mmap(struct file *filp, struct vm_area_struct *vma)
+{
+ int vma_size = vma->vm_end - vma->vm_start;
+ int offset = vma->vm_pgoff << PAGE_SHIFT;
+
+ printk(KERN_INFO "MWR: Device signed_integer_mmap( vma_size: %x, offset: %x)\n", vma_size, offset);
+ if (vma_size > 0x10000 || offset < 0 || offset > 0x1000 || (vma_size + offset > 0x10000))
+ {
+  printk(KERN_INFO "MWR: mmap failed, requested too large a chunk of memory\n");
+  return -EAGAIN;
+ }
+ if (remap_pfn_range(vma, vma->vm_start, offset, vma->vm_end - vma->vm_start, vma->vm_page_prot))
+ {
+  printk(KERN_INFO "MWR: Device signed_integer_mmap failed\n");
+  return -EAGAIN;
+ }
+ printk(KERN_INFO "MWR: Device signed_integer_mmap OK\n");
+ return 0;
+}
+
+5. 空mmap实现
+static int empty_mmap(struct file *filp, struct vm_area_struct *vma)
+{
+ printk(KERN_INFO "VULKLAB: empty_mmap\n");
+ return 0;
+}
+这时候尝试在用户态mmap该设备，内核日志能够成功打出，查看/proc/<pid>/maps也可以发现该映射和预期不同，因为没有调用remap_pfn_range为它分配相应的物理内存。当我们mmap过后，尝试读取访问这片内存时，根据内核版本或架构实现的不同，可能会有不同的异常，例如进程崩溃，或内核崩溃，在一些3.10的arm/arm64内核中，这样的操作就会造成panic。
+
+6. 补充说明
+1). 绕过安全增强措施如SElinux，Smack
+通过mmap内存修改内核数据的方式，我们可以绕过SELinux等安全增强措施。通常在cred的security指针中保存了安全模块的一些数据结构，通过更改这些指针，比如指向我们可控的用户态内存，然后可以暴力破解来更新其中的sid，就可以将进程的安全标签更新为kernel或者init标签，详情可以参考参考文档：
+To bypass SELinux we should attempt following steps:
+- Prepare a new SELinux policy which sets our current SELinux context to permissive
+- Pin fake security structure which contains all zeros
+- Attempt to reload SELinux policy
+- Restore the old security pointer
+- Attempt to perform a malicious action which was previously prohibited by SELinux
+- If it works, we have bypassed SELinux
+- If not, increment sid values by one in our fake security structure, and try again
+
+2). 除了remap_pfn_range外，以下函数也有类似问题：
+vm_insert_page
+vm_insert_pfn
+vm_insert_pfn_prot
+vm_iomap_memory
+io_remap_pfn_range
+remap_vmalloc_range_partial
+remap_vmalloc_range
+
+3). 在此类问题中有两个重要参数：offset和size，所以我们可以通过fuzz来比较快的发现此类问题，fuzz的时候要注意广泛的取值，并注意边界值的检查。
+
+4). 漏洞范围
+除了驱动设备，其他例如proc、sysfs、debugfs、自定义文件系统、socket等子系统基本也都能实现自定义的mmap处理函数，也可能存在类似问题。
+另外除了remap_pfn_range不只是在mmap中可能被调用，在其他syscall中也可能被调用，尤其ioctl中也需要特别关注此类调用。
+
+参考：
+https://labs.mwrinfosecurity.com/assets/BlogFiles/mwri-mmap-exploitation-whitepaper-2017-09-18.pdf 
+

