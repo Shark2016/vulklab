@@ -3,8 +3,11 @@
 #include <linux/fs.h>
 #include <linux/mm.h>
 #include <linux/slab.h>
-#include <asm/xen/page.h>
 #include "vulklab.h"
+
+#ifndef virt_to_pfn
+#define virt_to_pfn(kaddr)	(__pa(kaddr) >> PAGE_SHIFT)
+#endif
 
 static int size = 0x10000;
 

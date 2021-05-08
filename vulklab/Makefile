@@ -7,5 +7,6 @@ vulklab-objs += \
 	vulkdev3.o \
 	vulkdev4.o \
 	vulkdev5.o \
+	vulkdev6.o \
 	vulklog.o
 

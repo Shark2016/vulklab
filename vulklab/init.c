@@ -46,6 +46,13 @@ static struct miscdevice misc_dev5 = {
 	.mode	= 0666,
 };
 
+static struct miscdevice misc_dev6 = {
+	.minor	= MISC_DYNAMIC_MINOR,
+	.name	= "vulkdev6",
+	.fops	= &vulkdev6_ops,
+	.mode	= 0666,
+};
+
 static int __init vulklab_init(void)
 {
 	if (vulklog_init())
@@ -61,8 +68,12 @@ static int __init vulklab_init(void)
 		goto err_dev4;
 	if (misc_register(&misc_dev5))
 		goto err_dev5;
+	if (misc_register(&misc_dev6))
+		goto err_dev6;
 	return 0;
 
+err_dev6:
+	misc_deregister(&misc_dev5);
 err_dev5:
 	misc_deregister(&misc_dev4);
 err_dev4:
@@ -78,6 +89,7 @@ err_dev1:
 
 static void __exit vulklab_exit(void)
 {
+	misc_deregister(&misc_dev6);
 	misc_deregister(&misc_dev5);
 	misc_deregister(&misc_dev4);
 	misc_deregister(&misc_dev3);

@@ -27,5 +27,7 @@ a vulnerable kernel module to do kernel-exploit exercise
   [https://github.com/Shark2016/vulklab/blob/main/doc/VULKLAB4.txt](https://github.com/Shark2016/vulklab/blob/main/doc/VULKLAB4.txt)
 - mmap out of bounds
   [https://github.com/Shark2016/vulklab/blob/main/doc/VULKLAB5.txt](https://github.com/Shark2016/vulklab/blob/main/doc/VULKLAB5.txt)
+- addr_limit overwrite/set_fs
+  [https://github.com/Shark2016/vulklab/blob/main/vulkexp/jni/vulkdev_addrlimit.c](https://github.com/Shark2016/vulklab/blob/main/vulkexp/jni/vulkdev_addrlimit.c)
 - CVE-2014-3153 futex exploit
   [https://github.com/Shark2016/vulklab/blob/main/doc/VULKLAB6.txt](https://github.com/Shark2016/vulklab/blob/main/doc/VULKLAB6.txt)
