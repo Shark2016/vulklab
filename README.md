@@ -5,6 +5,7 @@ a vulnerable kernel module to do kernel-exploit exercise
 ### the following vulnerabilities included:
 - shellcode execute
 - kernel stack overflow
+- set_fs/addr_limit overwrite
 - mmap out of bounds
 - ...
 
